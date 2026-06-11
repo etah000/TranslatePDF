@@ -41,6 +41,7 @@ dependencies = [
     "sse-starlette>=2.3.3",
     "fastapi>=0.115.12",
     "uvicorn>=0.34.2",
+    "python-multipart>=0.0.9",
     "legacy-cgi; python_version >= '3.13'",
     "chardet>=5.2.0",
     "gradio-i18n==0.3.4", # since we have hooked it for language selection
@@ -69,11 +70,6 @@ Homepage = "https://github.com/PDFMathTranslate-next/PDFMathTranslate-next"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[project.scripts]
-pdf2zh = "pdf2zh_next.main:cli"
-pdf2zh2 = "pdf2zh_next.main:cli"
-pdf2zh_next = "pdf2zh_next.main:cli"
 
 [tool.flake8]
 ignore = ["E203", "E261", "E501", "W503", "E741"]

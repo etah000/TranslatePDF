@@ -1,0 +1,32 @@
+{
+  "active_model": "openai",
+  "openai": {
+    "translate_engine_type": "OpenAI",
+    "openai_model": "MiniMax-M3",
+    "openai_base_url": "https://api.minimaxi.com/v1",
+    "openai_api_key": "sk-cp-DUbPLfNuisDx-FAXq5bUliwJP6nigl_dCZnjVPuMdip5LYVq1SHstkfBq5dqzTQ5nbMuyxIeEhLx9Rmb18EIPNg7E8BSgJytqYzeHy8XgzQZ_q_vjYEW4yg",
+    "openai_timeout": "300",
+    "openai_temperature": "0",
+    "openai_reasoning_effort": null,
+    "openai_enable_json_mode": false,
+    "openai_send_temprature": false,
+    "openai_send_reasoning_effort": false
+  },
+  "claudecode": {
+    "translate_engine_type": "ClaudeCode",
+    "claude_code_path": "claude",
+    "claude_code_model": "sonnet"
+  },
+  "translation": {
+    "qps": 4,
+    "ignore_cache": false,
+    "no_dual": false,
+    "no_mono": false,
+    "watermark_output_mode": "no watermark",
+    "min_text_length": 5
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8765
+  }
+}
