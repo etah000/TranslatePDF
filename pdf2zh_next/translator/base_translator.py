@@ -3,8 +3,8 @@ import logging
 import re
 from abc import ABC
 from abc import abstractmethod
+from typing import Any
 
-from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
 from pdf2zh_next.translator.cache import TranslationCache
 
@@ -21,7 +21,7 @@ class BaseTranslator(ABC):
 
     def __init__(
         self,
-        settings: SettingsModel,
+        settings: Any,
         rate_limiter: BaseRateLimiter,
     ):
         """

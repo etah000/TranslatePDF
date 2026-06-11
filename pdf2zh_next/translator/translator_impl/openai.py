@@ -1,9 +1,9 @@
 import logging
+from typing import Any
 
 import httpx
 import openai
 from babeldoc.utils.atomic_integer import AtomicInteger
-from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
 from pdf2zh_next.translator.base_translator import BaseTranslator
 from tenacity import before_sleep_log
@@ -21,7 +21,7 @@ class OpenAITranslator(BaseTranslator):
 
     def __init__(
         self,
-        settings: SettingsModel,
+        settings: Any,
         rate_limiter: BaseRateLimiter,
     ):
         super().__init__(settings, rate_limiter)

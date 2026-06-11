@@ -2,8 +2,8 @@ import json
 import logging
 import os
 import subprocess
+from typing import Any
 
-from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
 from pdf2zh_next.translator.base_translator import BaseTranslator
 from tenacity import before_sleep_log
@@ -20,7 +20,7 @@ class ClaudeCodeTranslator(BaseTranslator):
 
     def __init__(
         self,
-        settings: SettingsModel,
+        settings: Any,
         rate_limiter: BaseRateLimiter,
     ):
         super().__init__(settings, rate_limiter)

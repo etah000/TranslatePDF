@@ -28,7 +28,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 # translation cache (peewee + SQLite at ~/.cache/pdf2zh_next/cache.v1.db)
 # and logging configuration. Keep this import first.
 import babeldoc.assets.assets  # noqa: F401  warmup side-effect
-import pdf2zh_next.main  # noqa: F401  triggers init_db()
+# Importing pdf2zh_next.translator.cache runs init_db() at module bottom
+# (creates ~/.cache/pdf2zh_next/cache.v1.db and the translation-cache table).
+import pdf2zh_next.translator.cache  # noqa: F401
 from pdf2zh_next.config.translate_engine_model import ClaudeCodeSettings
 from pdf2zh_next.config.translate_engine_model import OpenAISettings
 from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
