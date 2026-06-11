@@ -11,7 +11,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -20,28 +22,167 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import openai
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
-# --- pdf2zh_next reuse -----------------------------------------------------
-# Importing pdf2zh_next.main has the side effect of initialising the
-# translation cache (peewee + SQLite at ~/.cache/pdf2zh_next/cache.v1.db)
-# and logging configuration. Keep this import first.
+# BabelDoc: provides parsing, splitting, layout, translation driver,
+# cache, QPS rate limiter, and the BaseTranslator class we inherit from.
 import babeldoc.assets.assets  # noqa: F401  warmup side-effect
-# Importing pdf2zh_next.translator.cache runs init_db() at module bottom
-# (creates ~/.cache/pdf2zh_next/cache.v1.db and the translation-cache table).
-import pdf2zh_next.translator.cache  # noqa: F401
-from pdf2zh_next.config.translate_engine_model import ClaudeCodeSettings
-from pdf2zh_next.config.translate_engine_model import OpenAISettings
-from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
-from pdf2zh_next.translator.rate_limiter.qps_rate_limiter import QPSRateLimiter
-from pdf2zh_next.translator.translator_impl.claudecode import ClaudeCodeTranslator
-from pdf2zh_next.translator.translator_impl.openai import OpenAITranslator
-
-# BabelDoc
+import babeldoc.translator.cache  # noqa: F401  triggers init_db() at import
 from babeldoc.format.pdf.high_level import async_translate
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
+from babeldoc.translator.translator import BaseTranslator
+from babeldoc.translator.translator import set_translate_rate_limiter
+
+
+# ---------------------------------------------------------------------------
+# Translators — two thin subclasses of BabelDoc's BaseTranslator.
+# BabelDoc handles cache lookup, rate-limit wait, and `<think>` stripping;
+# we only implement do_translate / do_llm_translate.
+# ---------------------------------------------------------------------------
+def _translation_prompt(text: str, lang_out: str) -> list[dict]:
+    """Build the chat-completions message list for a translation request."""
+    return [{
+        "role": "user",
+        "content": (
+            f"You are a professional,authentic machine translation engine.\n\n"
+            f";; Treat next line as plain text input and translate it into "
+            f"{lang_out}, output translation ONLY. If translation is "
+            f"unnecessary (e.g. proper nouns, codes, {{{{1}}}}, etc.), return "
+            f"the original text. NO explanations. NO notes. Input:\n\n{text}"
+        ),
+    }]
+
+
+class OpenAITranslator(BaseTranslator):
+    """OpenAI / OpenAI-compatible chat-completions translator."""
+
+    name = "openai"
+
+    def __init__(self, settings: SimpleNamespace, lang_in: str, lang_out: str):
+        super().__init__(lang_in, lang_out, ignore_cache=settings.ignore_cache)
+        self.client = openai.OpenAI(
+            base_url=settings.openai_base_url,
+            api_key=settings.openai_api_key,
+            timeout=float(settings.openai_timeout) if settings.openai_timeout else openai.NOT_GIVEN,
+        )
+        self.model: str = settings.openai_model
+        self.options: dict[str, Any] = {}
+        if settings.openai_send_temprature and settings.openai_temperature:
+            self.options["temperature"] = float(settings.openai_temperature)
+            self.add_cache_impact_parameters("temperature", self.options["temperature"])
+        if settings.openai_send_reasoning_effort and settings.openai_reasoning_effort:
+            self.options["reasoning_effort"] = settings.openai_reasoning_effort
+            self.add_cache_impact_parameters("reasoning_effort", self.options["reasoning_effort"])
+        if settings.openai_enable_json_mode:
+            self.add_cache_impact_parameters("enable_json_mode", True)
+        self.add_cache_impact_parameters("model", self.model)
+        self.add_cache_impact_parameters("prompt", _translation_prompt("", self.lang_out)[0]["content"])
+
+    def _call(self, messages: list[dict], response_format_json: bool = False) -> str:
+        opts = self.options.copy()
+        if response_format_json and self.options.get("enable_json_mode"):
+            opts["response_format"] = {"type": "json_object"}
+        r = self.client.chat.completions.create(
+            model=self.model, **opts, messages=messages,
+        )
+        return self._remove_cot_content(r.choices[0].message.content.strip())
+
+    def do_translate(self, text, rate_limit_params=None):
+        return self._call(_translation_prompt(text, self.lang_out))
+
+    def do_llm_translate(self, text, rate_limit_params=None):
+        return self._call(
+            [{"role": "user", "content": text}],
+            response_format_json=bool(
+                rate_limit_params and rate_limit_params.get("request_json_mode")
+            ),
+        )
+
+
+class ClaudeCodeTranslator(BaseTranslator):
+    """Translator that shells out to the local `claude` CLI."""
+
+    name = "claudecode"
+
+    def __init__(self, settings: SimpleNamespace, lang_in: str, lang_out: str):
+        super().__init__(lang_in, lang_out, ignore_cache=settings.ignore_cache)
+        self.cli_path: str = settings.claude_code_path
+        self.model: str = settings.claude_code_model
+        self._test_cli()
+        self.add_cache_impact_parameters("model", self.model)
+        self.add_cache_impact_parameters("prompt", _translation_prompt("", self.lang_out)[0]["content"])
+
+    def _test_cli(self) -> None:
+        try:
+            r = subprocess.run(
+                [self.cli_path, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                raise ValueError(f"claude CLI error: {r.stderr}")
+        except FileNotFoundError as e:
+            raise ValueError(
+                f"claude CLI not found at '{self.cli_path}'"
+            ) from e
+
+    @staticmethod
+    def _parse_stream_json(output: str) -> str:
+        chunks: list[str] = []
+        for line in output.strip().splitlines():
+            if not line.strip().startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "assistant" and "message" in ev:
+                for part in ev["message"].get("content", []):
+                    if part.get("type") == "text":
+                        chunks.append(part.get("text", ""))
+            elif ev.get("type") == "text":
+                chunks.append(ev.get("text", ""))
+        result = "".join(chunks).strip()
+        if not result:
+            raise ValueError("No translation received from Claude Code")
+        return result
+
+    def do_translate(self, text, rate_limit_params=None):
+        messages = _translation_prompt(text, self.lang_out)
+        cmd = [
+            self.cli_path, "-p",
+            "--model", self.model,
+            "--max-turns", "1",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--disallowedTools",
+            "Task Bash Glob Grep LS exit_plan_mode Read Edit MultiEdit Write "
+            "NotebookRead NotebookEdit TodoRead TodoWrite",
+        ]
+        env = os.environ.copy()
+        env.pop("ANTHROPIC_API_KEY", None)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=env,
+            )
+            stdout, stderr = proc.communicate(
+                input=json.dumps({"type": "user", "message": messages[0]}),
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, stderr)
+        return self._parse_stream_json(stdout)
+
+    def do_llm_translate(self, text, rate_limit_params=None):
+        return self.do_translate(text, rate_limit_params)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -141,18 +282,39 @@ class AppConfig:
     """Holds validated translator settings derived from config.json."""
 
     def __init__(self, raw: dict):
-        self.raw = raw
         self.active_model: str = raw.get("active_model", "openai")
         if self.active_model not in ALLOWED_MODELS:
             raise ValueError(
                 f"active_model must be one of {ALLOWED_MODELS}, got {self.active_model!r}"
             )
-        # Validate engine settings via Pydantic
+        # Engine settings as a flat dict. Each translator reads only the keys
+        # it knows about; defaults below match what OpenAISettings /
+        # ClaudeCodeSettings used to provide.
         if self.active_model == "openai":
-            self.engine_settings = OpenAISettings(**raw["openai"])
+            self.engine: dict = {
+                "openai_model":         "gpt-4o-mini",
+                "openai_base_url":      None,
+                "openai_api_key":       None,
+                "openai_timeout":       None,
+                "openai_temperature":   None,
+                "openai_reasoning_effort": None,
+                "openai_send_temprature":   False,
+                "openai_send_reasoning_effort": False,
+                "openai_enable_json_mode": False,
+                **raw.get("openai", {}),
+            }
+            if not self.engine["openai_api_key"]:
+                raise ValueError("openai.openai_api_key is required")
+            if self.engine["openai_timeout"] is not None:
+                float(self.engine["openai_timeout"])  # raises if invalid
         else:
-            self.engine_settings = ClaudeCodeSettings(**raw["claudecode"])
-        self.engine_settings.validate_settings()
+            self.engine: dict = {
+                "claude_code_path":  "claude",
+                "claude_code_model": "sonnet",
+                **raw.get("claudecode", {}),
+            }
+            if not self.engine["claude_code_path"]:
+                raise ValueError("claudecode.claude_code_path is required")
         # Translation defaults
         tr = raw.get("translation", {})
         self.qps: int = int(tr.get("qps", 4))
@@ -168,22 +330,11 @@ class AppConfig:
         self.host: str = sv.get("host", "0.0.0.0")
         self.port: int = int(sv.get("port", 8765))
 
-    def build_settings(self, lang_in: str, lang_out: str) -> SimpleNamespace:
-        """Compose a minimal `settings`-like object the translators expect.
-
-        OpenAITranslator and ClaudeCodeTranslator read:
-          - settings.translate_engine_settings.<engine_specific_fields>
-          - settings.translation.{lang_in, lang_out, ignore_cache}
-        """
-        return SimpleNamespace(
-            translate_engine_settings=self.engine_settings,
-            translation=SimpleNamespace(
-                lang_in=lang_in,
-                lang_out=lang_out,
-                ignore_cache=self.ignore_cache,
-                qps=self.qps,
-            ),
-        )
+    def build_settings(self) -> SimpleNamespace:
+        """A flat settings namespace the translators read by attribute."""
+        s = SimpleNamespace(**self.engine)
+        s.ignore_cache = self.ignore_cache
+        return s
 
 
 def load_config(path: Path) -> AppConfig:
@@ -216,11 +367,10 @@ async def reload_config() -> AppConfig:
 # ---------------------------------------------------------------------------
 # Translator factory
 # ---------------------------------------------------------------------------
-def make_translator(cfg: AppConfig, settings: SimpleNamespace) -> Any:
-    rate_limiter: BaseRateLimiter = QPSRateLimiter(cfg.qps) if cfg.qps > 0 else BaseRateLimiter()
+def make_translator(cfg: AppConfig, settings: SimpleNamespace, lang_in: str, lang_out: str):
     if cfg.active_model == "openai":
-        return OpenAITranslator(settings, rate_limiter)
-    return ClaudeCodeTranslator(settings, rate_limiter)
+        return OpenAITranslator(settings, lang_in, lang_out)
+    return ClaudeCodeTranslator(settings, lang_in, lang_out)
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +390,10 @@ def _file_meta(path: Path) -> dict:
 
 async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
     cfg = await get_config()
-    settings = cfg.build_settings(lang_in, lang_out)
-    translator = make_translator(cfg, settings)
-    term_translator = make_translator(cfg, settings)  # same engine for now
+    settings = cfg.build_settings()
+    translator = make_translator(cfg, settings, lang_in, lang_out)
+    term_translator = make_translator(cfg, settings, lang_in, lang_out)  # same engine
+    set_translate_rate_limiter(max(1, cfg.qps))
 
     config = TranslationConfig(
         input_file=task.pdf_path,
