@@ -104,12 +104,46 @@ class OpenAITranslator(BaseTranslator):
         ).strip()
 
     def _call(self, messages: list[dict], response_format_json: bool = False) -> str:
+        import openai as _openai
+
         opts = self.options.copy()
         if response_format_json and self.options.get("enable_json_mode"):
             opts["response_format"] = {"type": "json_object"}
-        r = self.client.chat.completions.create(
-            model=self.model, **opts, messages=messages,
-        )
+
+        # Retry on transient rate-limit errors with exponential back-off.
+        # Quota-exhausted (insufficient_quota) is NOT retried — it won't
+        # recover without human intervention.
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = self.client.chat.completions.create(
+                    model=self.model, **opts, messages=messages,
+                )
+                break
+            except _openai.RateLimitError as e:
+                body = getattr(e, "body", None) or {}
+                if isinstance(body, dict):
+                    inner = body.get("error", body)
+                    if isinstance(inner, dict):
+                        code = inner.get("code", "")
+                        msg = str(inner.get("message", e))
+                    else:
+                        code = ""
+                        msg = str(e)
+                else:
+                    code = ""
+                    msg = str(e)
+                # Quota exhaustion — no point retrying.
+                if code == "insufficient_quota" or "insufficient_quota" in msg:
+                    raise RuntimeError(
+                        f"API quota exhausted for model '{self.model}'."
+                        f" Switch to a different model or top up your account."
+                    ) from e
+                if attempt == max_retries:
+                    raise
+                wait = min(2 ** attempt, 30)
+                time.sleep(wait)
+
         choice = r.choices[0]
         content = getattr(choice.message, "content", None)
         if not content:
@@ -225,7 +259,7 @@ OUTPUT_DIR = APP_ROOT / "outputs"
 DEFAULT_CONFIG_PATH = APP_ROOT / "config.json"
 CONFIG_PATH = Path(os.environ.get("PDF2ZH_CONFIG", DEFAULT_CONFIG_PATH))
 
-ALLOWED_MODELS = ("openai", "claudecode", "deepseek")
+ALLOWED_MODELS = ("openai", "claudecode", "deepseek", "minimax")
 # Defaults for the UI (lang_in=en, lang_out=zh). Both can be overridden
 # per-request; values must come from the whitelists below.
 DEFAULT_SOURCE_LANG = "en"
@@ -322,7 +356,7 @@ class AppConfig:
         # Engine settings as a flat dict. Each translator reads only the keys
         # it knows about; defaults below match what OpenAISettings /
         # ClaudeCodeSettings used to provide.
-        if self.active_model in ("openai", "deepseek"):
+        if self.active_model in ("openai", "deepseek", "minimax"):
             defaults: dict = {
                 "openai_model":         "gpt-4o-mini",
                 "openai_base_url":      None,
@@ -405,7 +439,7 @@ async def reload_config() -> AppConfig:
 # Translator factory
 # ---------------------------------------------------------------------------
 def make_translator(cfg: AppConfig, settings: SimpleNamespace, lang_in: str, lang_out: str):
-    if cfg.active_model in ("openai", "deepseek"):
+    if cfg.active_model in ("openai", "deepseek", "minimax"):
         return OpenAITranslator(settings, lang_in, lang_out)
     return ClaudeCodeTranslator(settings, lang_in, lang_out)
 
@@ -458,7 +492,7 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
         task.task_id,
         cfg.active_model,
         getattr(cfg, "engine", {}).get(
-                "openai_model" if cfg.active_model in ("openai", "deepseek") else "claude_code_model",
+                "openai_model" if cfg.active_model in ("openai", "deepseek", "minimax") else "claude_code_model",
                 "?"),
         lang_in, lang_out, cfg.qps,
         cfg.watermark_str, cfg.no_dual, cfg.no_mono,
@@ -591,19 +625,13 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
                     event_out["stage_elapsed"] = round(time.monotonic() - current_stage_t0, 1)
             if etype == "finish":
                 res = event["translate_result"]
+                # babeldoc names outputs as <stem>.<lang>.<kind>.pdf already
+                # (see pdf_creater.py:1456-1532).  With WatermarkOutputMode
+                # "NoWatermark" the no_watermark_* attributes point at the
+                # same paths as mono_/dual_ — just use the canonical keys.
                 task.result = {
-                    "original_pdf_path": str(getattr(res, "original_pdf_path", "")),
                     "mono_pdf_path": str(getattr(res, "mono_pdf_path", "") or ""),
                     "dual_pdf_path": str(getattr(res, "dual_pdf_path", "") or ""),
-                    "no_watermark_mono_pdf_path": str(
-                        getattr(res, "no_watermark_mono_pdf_path", "") or ""
-                    ),
-                    "no_watermark_dual_pdf_path": str(
-                        getattr(res, "no_watermark_dual_pdf_path", "") or ""
-                    ),
-                    "auto_extracted_glossary_path": str(
-                        getattr(res, "auto_extracted_glossary_path", "") or ""
-                    ),
                     "total_seconds": float(getattr(res, "total_seconds", 0.0)),
                 }
                 event_out["result"] = task.result
@@ -720,10 +748,22 @@ async def api_translate(
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="file must be a PDF")
 
+    # Derive a safe stem from the original filename for human-readable outputs.
+    raw_stem = Path(file.filename).stem
+    safe_stem = re.sub(r"[^a-zA-Z0-9._-]", "_", raw_stem).strip("_") or "document"
+    # Avoid overwriting a previous upload / output with the same stem.
+    dedup = ""
+    while (UPLOAD_DIR / f"{safe_stem}{dedup}.pdf").exists() or any(
+        (OUTPUT_DIR / f"{safe_stem}{dedup}{s}").exists()
+        for s in ("-mono.pdf", "-dual.pdf",
+                  "-mono.no_watermark.pdf", "-dual.no_watermark.pdf")
+    ):
+        dedup = f"-{uuid.uuid4().hex[:6]}"
+    stem = f"{safe_stem}{dedup}"
+
     task_id = uuid.uuid4().hex
-    pdf_path = UPLOAD_DIR / f"{task_id}.pdf"
-    out_dir = OUTPUT_DIR / task_id
-    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = UPLOAD_DIR / f"{stem}.pdf"
+    out_dir = OUTPUT_DIR  # no uuid subdir — babeldoc names files after the input stem
 
     # Write the uploaded file via the default thread pool so the event loop
     # stays free to serve SSE connections and health checks.
@@ -812,8 +852,6 @@ async def api_task_events(task_id: str, request: Request):
 _DOWNLOAD_KIND_TO_ATTR = {
     "dual": "dual_pdf_path",
     "mono": "mono_pdf_path",
-    "dual_no_watermark": "no_watermark_dual_pdf_path",
-    "mono_no_watermark": "no_watermark_mono_pdf_path",
 }
 
 
@@ -912,7 +950,6 @@ INDEX_HTML = """<!doctype html>
   <div class="row">
     <progress id="bar" value="0" max="100"></progress>
     <span id="pct" class="status">0%</span>
-    <span id="stage" class="status"></span>
     <span id="elapsed" class="status" style="display:none"></span>
   </div>
   <pre id="log"></pre>
@@ -941,7 +978,6 @@ $("go").addEventListener("click", async () => {
   $("downloads").innerHTML = "";
   $("log").textContent = "";
   $("bar").value = 0; $("pct").textContent = "0%";
-  $("stage").textContent = "";
   stopElapsed();
   const fd = new FormData();
   fd.append("file", file);
@@ -983,19 +1019,19 @@ $("go").addEventListener("click", async () => {
       }
     } else if (e.type === "progress_start") {
       const extra = e.total_elapsed ? " | total=" + e.total_elapsed.toFixed(0) + "s" : "";
-      $("stage").textContent = e.stage + " (0/" + e.stage_total + ")" + extra;
+      log("▶ " + e.stage + " (0/" + e.stage_total + ")" + extra);
     } else if (e.type === "progress_update") {
       if (typeof e.overall_progress === "number") {
         $("bar").value = e.overall_progress;
         $("pct").textContent = e.overall_progress.toFixed(1) + "%";
       }
-      let info = e.stage + " (" + e.stage_current + "/" + e.stage_total + ")";
+      let info = "  " + e.stage_current + "/" + e.stage_total;
       if (e.stage_elapsed) info += " | stage=" + e.stage_elapsed.toFixed(0) + "s";
       if (e.total_elapsed) info += " total=" + e.total_elapsed.toFixed(0) + "s";
-      $("stage").textContent = info;
+      log(info);
     } else if (e.type === "progress_end") {
       const extra = e.total_elapsed ? " | total=" + e.total_elapsed.toFixed(0) + "s" : "";
-      $("stage").textContent = e.stage + " done" + extra;
+      log("✔ " + e.stage + " done" + extra);
     } else if (e.type === "progress_stall") {
       log("⚠ stalled: no progress for " + e.elapsed_since_last_event.toFixed(0)
           + "s (stage: " + (e.current_stage || "?") + ")");
@@ -1003,10 +1039,8 @@ $("go").addEventListener("click", async () => {
       $("bar").value = 100; $("pct").textContent = "100%";
       log("Done in " + e.result.total_seconds.toFixed(1) + "s");
       const links = [
+        ["mono", "Mono (translated)"],
         ["dual", "Dual (bilingual)"],
-        ["mono", "Mono (translated only)"],
-        ["dual_no_watermark", "Dual (no watermark)"],
-        ["mono_no_watermark", "Mono (no watermark)"],
       ];
       const div = $("downloads");
       for (const [k, label] of links) {
