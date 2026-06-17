@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -55,6 +56,18 @@ def _translation_prompt(text: str, lang_out: str) -> list[dict]:
             f"the original text. NO explanations. NO notes. Input:\n\n{text}"
         ),
     }]
+
+
+def _check_pause(translator):
+    """Block the calling thread if the task is paused.
+
+    Called from ``do_translate`` / ``do_llm_translate`` (worker thread)
+    before every API call, so the pause takes effect between paragraphs
+    without losing any completed work.
+    """
+    ev = getattr(translator, "_pause_event", None)
+    if ev is not None and not ev.is_set():
+        ev.wait()
 
 
 class OpenAITranslator(BaseTranslator):
@@ -151,6 +164,7 @@ class OpenAITranslator(BaseTranslator):
         return self._remove_cot_content(str(content).strip())
 
     def do_translate(self, text, rate_limit_params=None):
+        _check_pause(self)
         return self._call(_translation_prompt(text, self.lang_out))
 
     def do_llm_translate(self, text, rate_limit_params=None):
@@ -161,6 +175,7 @@ class OpenAITranslator(BaseTranslator):
         # so babeldoc falls back to ILTranslator (paragraph-at-a-time).
         if text is None:
             raise NotImplementedError("llm_translate probe")
+        _check_pause(self)
         return self._call(
             [{"role": "user", "content": text}],
             response_format_json=bool(
@@ -259,7 +274,22 @@ OUTPUT_DIR = APP_ROOT / "outputs"
 DEFAULT_CONFIG_PATH = APP_ROOT / "config.json"
 CONFIG_PATH = Path(os.environ.get("PDF2ZH_CONFIG", DEFAULT_CONFIG_PATH))
 
-ALLOWED_MODELS = ("openai", "claudecode", "deepseek", "minimax")
+_TRANSLATION_KEYS = frozenset({"translation", "server"})
+
+
+def _get_configured_models() -> list[str]:
+    """Return model names present in config.json (excluding meta sections)."""
+    try:
+        raw = json.loads(CONFIG_PATH.read_bytes())
+    except Exception:
+        return []
+    return [
+        key for key in raw
+        if key not in _TRANSLATION_KEYS
+        and key != "active_model"
+        and isinstance(raw[key], dict)
+        and ("openai_api_key" in raw[key] or "claude_code_path" in raw[key])
+    ]
 # Defaults for the UI (lang_in=en, lang_out=zh). Both can be overridden
 # per-request; values must come from the whitelists below.
 DEFAULT_SOURCE_LANG = "en"
@@ -324,17 +354,27 @@ class Task:
     __slots__ = (
         "task_id", "pdf_path", "output_dir", "status",
         "events", "result", "error", "asyncio_task",
+        "lang_in", "lang_out", "model_override",
+        "pause_event",  # threading.Event — set when paused
     )
 
-    def __init__(self, task_id: str, pdf_path: Path, output_dir: Path):
+    def __init__(self, task_id: str, pdf_path: Path, output_dir: Path,
+                 lang_in: str = "", lang_out: str = "",
+                 model_override: str | None = None):
         self.task_id = task_id
         self.pdf_path = pdf_path
         self.output_dir = output_dir
-        self.status = "pending"   # pending / running / done / error / cancelled
+        self.status = "pending"   # pending / running / done / error / cancelled / paused
         self.events: asyncio.Queue[dict] = asyncio.Queue()
         self.result: dict | None = None
         self.error: str | None = None
         self.asyncio_task: asyncio.Task | None = None  # populated when worker starts
+        self.lang_in = lang_in
+        self.lang_out = lang_out
+        self.model_override = model_override
+        self.pause_event = threading.Event()
+        self.pause_event.set()  # start in "not paused" state
+        # pause_event.is_set() → not paused; pause_event.wait() blocks when paused
 
 
 TASKS: dict[str, Task] = {}
@@ -349,15 +389,12 @@ class AppConfig:
 
     def __init__(self, raw: dict):
         self.active_model: str = raw.get("active_model", "openai")
-        if self.active_model not in ALLOWED_MODELS:
-            raise ValueError(
-                f"active_model must be one of {ALLOWED_MODELS}, got {self.active_model!r}"
-            )
         # Engine settings as a flat dict. Each translator reads only the keys
         # it knows about; defaults below match what OpenAISettings /
         # ClaudeCodeSettings used to provide.
-        if self.active_model in ("openai", "deepseek", "minimax"):
-            defaults: dict = {
+        model_cfg = raw.get(self.active_model, {})
+        if isinstance(model_cfg, dict) and "openai_api_key" in model_cfg:
+            self.engine: dict = {
                 "openai_model":         "gpt-4o-mini",
                 "openai_base_url":      None,
                 "openai_api_key":       None,
@@ -367,13 +404,8 @@ class AppConfig:
                 "openai_send_temprature":   False,
                 "openai_send_reasoning_effort": False,
                 "openai_enable_json_mode": False,
+                **model_cfg,
             }
-            if self.active_model == "deepseek":
-                defaults.update({
-                    "openai_model":    "deepseek-chat",
-                    "openai_base_url": "https://api.deepseek.com/v1",
-                })
-            self.engine: dict = {**defaults, **raw.get(self.active_model, {})}
             if not self.engine["openai_api_key"]:
                 raise ValueError(f"{self.active_model}.openai_api_key is required")
             if self.engine["openai_timeout"] is not None:
@@ -439,7 +471,9 @@ async def reload_config() -> AppConfig:
 # Translator factory
 # ---------------------------------------------------------------------------
 def make_translator(cfg: AppConfig, settings: SimpleNamespace, lang_in: str, lang_out: str):
-    if cfg.active_model in ("openai", "deepseek", "minimax"):
+    # Any model with openai_* config keys uses the OpenAI-compatible translator.
+    engine = getattr(cfg, "engine", {})
+    if "openai_api_key" in engine:
         return OpenAITranslator(settings, lang_in, lang_out)
     return ClaudeCodeTranslator(settings, lang_in, lang_out)
 
@@ -459,11 +493,43 @@ def _file_meta(path: Path) -> dict:
     }
 
 
-async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
+async def run_translation(task: Task, lang_in: str, lang_out: str,
+                         model_override: str | None = None) -> None:
     cfg = await get_config()
+    if model_override and model_override != cfg.active_model:
+        # Build a transient config for the requested model, reusing the same
+        # translation/server settings from config.json.
+        import copy
+        cfg = copy.copy(cfg)
+        cfg.active_model = model_override
+        # engine dict is populated by __init__ based on active_model — redo.
+        raw = json.loads(CONFIG_PATH.read_bytes())
+        if "openai_api_key" in raw.get(model_override, {}):
+            cfg.engine = {
+                "openai_model":         "gpt-4o-mini",
+                "openai_base_url":      None,
+                "openai_api_key":       None,
+                "openai_timeout":       None,
+                "openai_temperature":   None,
+                "openai_reasoning_effort": None,
+                "openai_send_temprature":   False,
+                "openai_send_reasoning_effort": False,
+                "openai_enable_json_mode": False,
+                **raw.get(model_override, {}),
+            }
+        else:
+            cfg.engine = {
+                "claude_code_path":  "claude",
+                "claude_code_model": "sonnet",
+                **raw.get(model_override, {}),
+            }
+
     settings = cfg.build_settings()
     translator = make_translator(cfg, settings, lang_in, lang_out)
     term_translator = make_translator(cfg, settings, lang_in, lang_out)  # same engine
+    # Wire the pause event into both translators so they block before API calls.
+    translator._pause_event = task.pause_event
+    term_translator._pause_event = task.pause_event
     set_translate_rate_limiter(max(1, cfg.qps))
 
     config = TranslationConfig(
@@ -483,6 +549,11 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
         report_interval=0.1,
         auto_extract_glossary=False,  # term extraction is slow; default off
     )
+    # Reuse in-memory IL from a previous run (model-switch resume path).
+    cached = getattr(task, "_cached_il", None)
+    if cached is not None:
+        config.cached_il = cached
+        del task._cached_il  # one-shot
     task.status = "running"
 
     fm = _file_meta(task.pdf_path)
@@ -492,7 +563,7 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
         task.task_id,
         cfg.active_model,
         getattr(cfg, "engine", {}).get(
-                "openai_model" if cfg.active_model in ("openai", "deepseek", "minimax") else "claude_code_model",
+                "openai_model" if "openai_api_key" in getattr(cfg, "engine", {}) else "claude_code_model",
                 "?"),
         lang_in, lang_out, cfg.qps,
         cfg.watermark_str, cfg.no_dual, cfg.no_mono,
@@ -544,6 +615,16 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
 
     try:
         async for event in async_translate(config):
+            # Honour pause: if the event is not cleared, wait here so the
+            # SSE stream pauses and the worker thread blocks at the next
+            # API call (see _check_pause above).
+            if not task.pause_event.is_set():
+                await asyncio.to_thread(task.pause_event.wait)
+                task.pause_event.set()  # restore "not paused" state
+                if task.status == "paused":
+                    task.status = "running"
+                    await emit({"type": "resumed", "task_id": task.task_id})
+
             etype = event.get("type")
 
             # ----- stage timing --------------------------------------------
@@ -557,6 +638,11 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
                     )
                     log.info("[%s]   pipeline stages: %s", task.task_id, stage_list)
             elif etype == "progress_start":
+                # Capture the in-memory IL when we enter the translation
+                # stage so model-switch resume can reuse it.
+                if event.get("stage", "").startswith("Translate"):
+                    task._cached_il = getattr(config, "cached_il", None)
+
                 new_stage = event.get("stage", "?")
                 stage_total = event.get("stage_total")
                 if new_stage != current_stage:
@@ -658,14 +744,18 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
         if current_stage is not None and current_stage_t0 is not None:
             elapsed = time.monotonic() - current_stage_t0
             perf[current_stage] = perf.get(current_stage, 0.0) + elapsed
+        # Respect an already-set status (e.g. "paused" from the pause endpoint
+        # or "cancelled" from a server-shutdown cancel).
+        if task.status not in ("paused",):
+            task.status = "cancelled"
+        action = task.status  # "paused" or "cancelled"
         log.warning(
-            "[%s] translation CANCELLED after %.2fs | partial_stages=%s",
-            task.task_id, time.monotonic() - run_t0,
+            "[%s] translation %s after %.2fs | partial_stages=%s",
+            task.task_id, action.upper(), time.monotonic() - run_t0,
             {k: round(v, 2) for k, v in perf.items()},
         )
-        task.status = "cancelled"
-        await emit_perf("cancelled")
-        await emit({"type": "cancelled", "task_id": task.task_id})
+        await emit_perf(action)
+        await emit({"type": action, "task_id": task.task_id})
         # Do not re-raise — during shutdown the event loop may already be
         # tearing down, and re-raising just produces an unhelpful traceback.
     except Exception as exc:  # noqa: BLE001
@@ -684,6 +774,13 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
         await emit_perf("done")
     finally:
         stall_task.cancel()
+        # Remove the IL checkpoint if the task didn't finish successfully.
+        _cp = task.output_dir / f"{task.pdf_path.stem}.il.pickle"
+        if _cp.exists():
+            try:
+                _cp.unlink()
+            except Exception:
+                pass
         await task.events.put(None)  # sentinel
 
 
@@ -722,6 +819,15 @@ async def health():
     return {"status": "ok", "active_model": cfg.active_model}
 
 
+@app.get("/api/models")
+async def api_models():
+    cfg = await get_config()
+    return {
+        "models": _get_configured_models(),
+        "default": cfg.active_model,
+    }
+
+
 @app.post("/api/reload-config")
 async def api_reload_config():
     cfg = await reload_config()
@@ -733,6 +839,7 @@ async def api_translate(
     file: UploadFile = File(...),
     lang_in: str = Form(...),
     lang_out: str = Form(...),
+    model: str = Form(""),  # optional — any model from config.json
 ):
     # Validate languages
     if lang_in not in ALLOWED_SOURCE_LANGS:
@@ -777,17 +884,21 @@ async def api_translate(
     log.info("Saved upload %s -> %s (%.1f MB)", file.filename, pdf_path,
              pdf_path.stat().st_size / (1024 * 1024))
 
-    task = Task(task_id, pdf_path, out_dir)
+    task = Task(task_id, pdf_path, out_dir, lang_in, lang_out,
+                model or None)
     # Push an immediate event so the UI shows feedback even before the first
     # babeldoc progress callback fires.
     await task.events.put({
         "type": "started",
         "task_id": task_id,
         "filename": file.filename,
+        "model": model or (await get_config()).active_model,
     })
     async with TASK_LOCK:
         TASKS[task_id] = task
-        task.asyncio_task = asyncio.create_task(run_translation(task, lang_in, lang_out))
+        task.asyncio_task = asyncio.create_task(
+            run_translation(task, lang_in, lang_out, model or None)
+        )
     return {"task_id": task_id}
 
 
@@ -806,19 +917,97 @@ async def api_task_status(task_id: str):
 
 @app.post("/api/tasks/{task_id}/cancel")
 async def api_task_cancel(task_id: str):
-    """Cancel a running translation task.
-
-    Idempotent: returns 200 even if the task is already finished/cancelled.
-    """
+    """Cancel a running translation task (terminal — cannot be resumed)."""
     task = TASKS.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     if task.status in ("done", "error", "cancelled"):
         return {"task_id": task_id, "status": task.status, "already_finished": True}
+    if task.status == "paused":
+        # Move from paused to cancelled.
+        task.status = "cancelled"
+        await task.events.put(
+            {"type": "cancelled", "task_id": task_id})
+        await task.events.put(None)
+        return {"task_id": task_id, "status": "cancelled"}
     if task.asyncio_task and not task.asyncio_task.done():
         task.asyncio_task.cancel()
         log.info("Cancel requested for task %s", task_id)
     return {"task_id": task_id, "status": "cancelling"}
+
+
+@app.post("/api/tasks/{task_id}/pause")
+async def api_task_pause(task_id: str):
+    """Pause a running translation — suspends in-place, no progress lost."""
+    task = TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status in ("done", "error", "cancelled", "paused"):
+        return {"task_id": task_id, "status": task.status, "already_finished": True}
+    # Clear the event → worker thread blocks before next API call,
+    # event loop blocks before next progress event.
+    task.pause_event.clear()
+    task.status = "paused"
+    log.info("Pause requested for task %s", task_id)
+    await task.events.put({"type": "paused", "task_id": task_id})
+    return {"task_id": task_id, "status": "paused"}
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def api_task_resume(task_id: str, request: Request):
+    """Resume a paused translation task.
+
+    If *model* query param is given and differs from the current model,
+    the task is cancelled and restarted with the new model.  Translated
+    paragraphs are served from cache, so only unfinished work consumes
+    quota.
+    """
+    task = TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status != "paused":
+        raise HTTPException(
+            status_code=409,
+            detail=f"task status is {task.status!r}, expected 'paused'",
+        )
+
+    new_model = request.query_params.get("model")
+    model_changed = bool(
+        new_model
+        and new_model != (task.model_override or (await get_config()).active_model)
+    )
+
+    if model_changed:
+        # Model switch — restart the pipeline with the new translator.
+        # If we reached the translation stage on the previous run, the
+        # in-memory IL is available and parsing stages are skipped.
+        task.model_override = new_model
+        task.pause_event.set()  # unblock old task so it can receive cancel
+        if task.asyncio_task and not task.asyncio_task.done():
+            task.asyncio_task.cancel()
+        # Give the old task a moment to unwind its thread-pool work.
+        await asyncio.sleep(0.5)
+        task.events = asyncio.Queue()
+        task.error = None
+        await task.events.put({
+            "type": "started",
+            "task_id": task_id,
+            "filename": task.pdf_path.name,
+            "model": new_model,
+        })
+        async with TASK_LOCK:
+            task.status = "running"
+            task.asyncio_task = asyncio.create_task(
+                run_translation(task, task.lang_in, task.lang_out, new_model)
+            )
+        return {"task_id": task_id, "status": "resumed", "model_changed": True}
+
+    # Same model — just unpause in-place.  The worker thread and event
+    # loop unblock without losing any progress.
+    task.pause_event.set()
+    task.status = "running"
+    log.info("Resume requested for task %s (same model)", task_id)
+    return {"task_id": task_id, "status": "resumed", "model_changed": False}
 
 
 @app.get("/api/tasks/{task_id}/events")
@@ -910,7 +1099,13 @@ INDEX_HTML = """<!doctype html>
 </head>
 <body>
   <h1>PDF Translator</h1>
-  <p class="status">Defaults: source <b>English</b> → target <b>Chinese</b>.</p>
+  <div class="row">
+    <label>Model
+      <select id="model">
+        <option value="">loading...</option>
+      </select>
+    </label>
+  </div>
   <div class="row">
     <label>Source language
       <select id="langIn">
@@ -945,6 +1140,8 @@ INDEX_HTML = """<!doctype html>
   <div class="row">
     <input type="file" id="file" accept="application/pdf">
     <button id="go">Translate</button>
+    <button id="pause" style="display:none">Pause</button>
+    <button id="resume" style="display:none;background:#059669">Resume</button>
     <button id="cancel" class="danger" style="display:none">Cancel</button>
   </div>
   <div class="row">
@@ -969,12 +1166,34 @@ function startElapsed() {
 }
 function stopElapsed() { if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; } }
 
+// Populate model dropdown from config.json on page load.
+(async function loadModels() {
+  try {
+    const r = await fetch("/api/models");
+    const d = await r.json();
+    const sel = $("model");
+    sel.innerHTML = '';
+    (d.models || []).forEach(m => {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m === d.default ? m + " (default)" : m;
+      if (m === d.default) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  } catch (e) {
+    $("model").innerHTML = '<option value="">(no models configured)</option>';
+  }
+})();
+
 $("go").addEventListener("click", async () => {
   const file = $("file").files[0];
   if (!file) { alert("Choose a PDF first"); return; }
   $("go").disabled = true;
   $("cancel").style.display = "inline-block";
   $("cancel").disabled = false;
+  $("pause").style.display = "inline-block";
+  $("pause").disabled = false;
+  $("resume").style.display = "none";
   $("downloads").innerHTML = "";
   $("log").textContent = "";
   $("bar").value = 0; $("pct").textContent = "0%";
@@ -983,6 +1202,8 @@ $("go").addEventListener("click", async () => {
   fd.append("file", file);
   fd.append("lang_in", $("langIn").value);
   fd.append("lang_out", $("langOut").value);
+  const modelVal = $("model").value;
+  if (modelVal) fd.append("model", modelVal);
   log("Uploading " + file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + " MB) ...");
   let r;
   try {
@@ -996,19 +1217,16 @@ $("go").addEventListener("click", async () => {
   const { task_id } = await r.json();
   log("task_id = " + task_id);
 
-  $("cancel").onclick = async () => {
-    $("cancel").disabled = true;
-    log("Cancelling ...");
-    try {
-      await fetch("/api/tasks/" + task_id + "/cancel", { method: "POST" });
-    } catch (e) { log("Cancel request failed: " + e); }
-  };
-
-  const es = new EventSource("/api/tasks/" + task_id + "/events");
-  es.onmessage = (ev) => {
+  let currentEs = null;
+  function connectSSE(tid) {
+    if (currentEs) { currentEs.close(); currentEs = null; }
+    stopElapsed();
+    currentEs = new EventSource("/api/tasks/" + tid + "/events");
+    currentEs.onmessage = (ev) => {
     const e = JSON.parse(ev.data);
     if (e.type === "started") {
-      log("Translation started – " + (e.filename || ""));
+      log("Translation started – " + (e.filename || "")
+          + (e.model ? " | model=" + e.model : ""));
       startElapsed();
     } else if (e.type === "stage_summary") {
       // Show the pipeline stages with their estimated weight percentages.
@@ -1051,17 +1269,26 @@ $("go").addEventListener("click", async () => {
         div.appendChild(a);
       }
       stopElapsed();
-      es.close();
+      if (currentEs) currentEs.close();
       finishClient();
+    } else if (e.type === "paused") {
+      log("⏸ Paused — resume or change model above and click Resume");
+      $("pause").style.display = "none";
+      $("cancel").style.display = "none";
+      $("resume").style.display = "inline-block";
+      $("resume").disabled = false;
+      $("go").disabled = false;
+      stopElapsed();
+      if (currentEs) currentEs.close();
     } else if (e.type === "cancelled") {
       log("Cancelled by user");
       stopElapsed();
-      es.close();
+      if (currentEs) currentEs.close();
       finishClient();
     } else if (e.type === "error") {
       log("ERROR: " + e.error);
       stopElapsed();
-      es.close();
+      if (currentEs) currentEs.close();
       finishClient();
     } else if (e.type === "perf") {
       const stages = Object.entries(e.stages || {})
@@ -1073,11 +1300,50 @@ $("go").addEventListener("click", async () => {
       log("event: " + e.type);
     }
   };
-  es.onerror = () => { log("SSE connection closed"); stopElapsed(); finishClient(); };
+    currentEs.onerror = () => { log("SSE connection closed"); stopElapsed(); finishClient(); };
+  }
+  connectSSE(task_id);
+
+  $("cancel").onclick = async () => {
+    $("cancel").disabled = true;
+    $("pause").disabled = true;
+    log("Cancelling ...");
+    try {
+      await fetch("/api/tasks/" + task_id + "/cancel", { method: "POST" });
+    } catch (e) { log("Cancel request failed: " + e); }
+  };
+  $("pause").onclick = async () => {
+    $("pause").disabled = true;
+    log("Pausing ...");
+    try {
+      await fetch("/api/tasks/" + task_id + "/pause", { method: "POST" });
+    } catch (e) { log("Pause request failed: " + e); }
+  };
+  $("resume").onclick = async () => {
+    $("resume").disabled = true;
+    const newModel = $("model").value;
+    log("Resuming with model=" + (newModel || "default") + " ...");
+    try {
+      const url = "/api/tasks/" + task_id + "/resume"
+        + (newModel ? "?model=" + encodeURIComponent(newModel) : "");
+      await fetch(url, { method: "POST" });
+      $("pause").style.display = "inline-block";
+      $("pause").disabled = false;
+      $("resume").style.display = "none";
+      $("cancel").style.display = "inline-block";
+      $("cancel").disabled = false;
+      $("bar").value = 0; $("pct").textContent = "0%";
+      connectSSE(task_id);  // re-open SSE for resumed task
+    } catch (e) { log("Resume request failed: " + e); }
+  };
 });
 
 function finishClient() {
   $("go").disabled = false;
+  $("pause").style.display = "none";
+  $("pause").onclick = null;
+  $("resume").style.display = "none";
+  $("resume").onclick = null;
   $("cancel").style.display = "none";
   $("cancel").onclick = null;
 }

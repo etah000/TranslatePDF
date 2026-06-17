@@ -1,7 +1,7 @@
 {
   "active_model": "minimax",
   "minimax": {
-    "translate_engine_type": "OpenAI",
+    "translate_engine_type": "MiniMax",
     "openai_model": "MiniMax-M2.7",
     "openai_base_url": "https://api.minimaxi.com/v1",
     "openai_api_key": "sk-cp-DUbPLfNuisDx-FAXq5bUliwJP6nigl_dCZnjVPuMdip5LYVq1SHstkfBq5dqzTQ5nbMuyxIeEhLx9Rmb18EIPNg7E8BSgJytqYzeHy8XgzQZ_q_vjYEW4yg",
@@ -13,6 +13,18 @@
     "openai_send_reasoning_effort": false
   },
   "deepseek": {
+    "translate_engine_type": "DeepSeek",
+    "openai_model": "deepseek-v4-flash",
+    "openai_base_url": "https://api.deepseek.com/v1",
+    "openai_api_key": "sk-9ad9767eb1154b8cbad7ca21cf7747af",
+    "openai_timeout": "300",
+    "openai_temperature": "0",
+    "openai_reasoning_effort": false,
+    "openai_enable_json_mode": false,
+    "openai_send_temprature": false,
+    "openai_send_reasoning_effort": false
+  },
+  "deepseek_ny": {
     "translate_engine_type": "DeepSeek",
     "openai_model": "deepseek-v4-flash",
     "openai_base_url": "https://api.deepseek.com/v1",
