@@ -82,6 +82,27 @@ class OpenAITranslator(BaseTranslator):
         self.add_cache_impact_parameters("model", self.model)
         self.add_cache_impact_parameters("prompt", _translation_prompt("", self.lang_out)[0]["content"])
 
+    @staticmethod
+    def _remove_cot_content(text: str) -> str:
+        """Strip ``<think>...</think>`` blocks that reasoning models prepend.
+
+        ``BaseTranslator._remove_cot_content`` no longer exists in babeldoc
+        0.6.x (it was removed when the upstream OpenAITranslator stopped
+        assuming the model emits CoT tokens).  Our local translator still
+        needs the behaviour because we point it at reasoning models like
+        ``MiniMax-M3`` whose chat completions start with a ``<think>`` block
+        before the actual translation.  Without stripping, every paragraph
+        starts with the model's scratchpad and the output PDF is unreadable.
+        """
+        if not text:
+            return ""
+        # Non-greedy + DOTALL so the block can span newlines; case-insensitive
+        # in case the model uppercases the tags.  Leave any text outside the
+        # block untouched and trim residual whitespace.
+        return re.sub(
+            r"<think>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE
+        ).strip()
+
     def _call(self, messages: list[dict], response_format_json: bool = False) -> str:
         opts = self.options.copy()
         if response_format_json and self.options.get("enable_json_mode"):
@@ -89,12 +110,23 @@ class OpenAITranslator(BaseTranslator):
         r = self.client.chat.completions.create(
             model=self.model, **opts, messages=messages,
         )
-        return self._remove_cot_content(r.choices[0].message.content.strip())
+        choice = r.choices[0]
+        content = getattr(choice.message, "content", None)
+        if not content:
+            return ""
+        return self._remove_cot_content(str(content).strip())
 
     def do_translate(self, text, rate_limit_params=None):
         return self._call(_translation_prompt(text, self.lang_out))
 
     def do_llm_translate(self, text, rate_limit_params=None):
+        # translator_supports_llm calls do_llm_translate(None) to probe
+        # whether the translator supports LLM mode.  Sending content=null
+        # to the API is wasteful and can trigger 400 errors from stricter
+        # providers (DeepSeek).  Return NotImplementedError immediately
+        # so babeldoc falls back to ILTranslator (paragraph-at-a-time).
+        if text is None:
+            raise NotImplementedError("llm_translate probe")
         return self._call(
             [{"role": "user", "content": text}],
             response_format_json=bool(
@@ -193,7 +225,7 @@ OUTPUT_DIR = APP_ROOT / "outputs"
 DEFAULT_CONFIG_PATH = APP_ROOT / "config.json"
 CONFIG_PATH = Path(os.environ.get("PDF2ZH_CONFIG", DEFAULT_CONFIG_PATH))
 
-ALLOWED_MODELS = ("openai", "claudecode")
+ALLOWED_MODELS = ("openai", "claudecode", "deepseek")
 # Defaults for the UI (lang_in=en, lang_out=zh). Both can be overridden
 # per-request; values must come from the whitelists below.
 DEFAULT_SOURCE_LANG = "en"
@@ -290,8 +322,8 @@ class AppConfig:
         # Engine settings as a flat dict. Each translator reads only the keys
         # it knows about; defaults below match what OpenAISettings /
         # ClaudeCodeSettings used to provide.
-        if self.active_model == "openai":
-            self.engine: dict = {
+        if self.active_model in ("openai", "deepseek"):
+            defaults: dict = {
                 "openai_model":         "gpt-4o-mini",
                 "openai_base_url":      None,
                 "openai_api_key":       None,
@@ -301,10 +333,15 @@ class AppConfig:
                 "openai_send_temprature":   False,
                 "openai_send_reasoning_effort": False,
                 "openai_enable_json_mode": False,
-                **raw.get("openai", {}),
             }
+            if self.active_model == "deepseek":
+                defaults.update({
+                    "openai_model":    "deepseek-chat",
+                    "openai_base_url": "https://api.deepseek.com/v1",
+                })
+            self.engine: dict = {**defaults, **raw.get(self.active_model, {})}
             if not self.engine["openai_api_key"]:
-                raise ValueError("openai.openai_api_key is required")
+                raise ValueError(f"{self.active_model}.openai_api_key is required")
             if self.engine["openai_timeout"] is not None:
                 float(self.engine["openai_timeout"])  # raises if invalid
         else:
@@ -368,7 +405,7 @@ async def reload_config() -> AppConfig:
 # Translator factory
 # ---------------------------------------------------------------------------
 def make_translator(cfg: AppConfig, settings: SimpleNamespace, lang_in: str, lang_out: str):
-    if cfg.active_model == "openai":
+    if cfg.active_model in ("openai", "deepseek"):
         return OpenAITranslator(settings, lang_in, lang_out)
     return ClaudeCodeTranslator(settings, lang_in, lang_out)
 
@@ -420,8 +457,8 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
         "watermark=%s | no_dual=%s | no_mono=%s | file=%s (%.2f MB)",
         task.task_id,
         cfg.active_model,
-        getattr(cfg.engine_settings,
-                "openai_model" if cfg.active_model == "openai" else "claude_code_model",
+        getattr(cfg, "engine", {}).get(
+                "openai_model" if cfg.active_model in ("openai", "deepseek") else "claude_code_model",
                 "?"),
         lang_in, lang_out, cfg.qps,
         cfg.watermark_str, cfg.no_dual, cfg.no_mono,
@@ -435,10 +472,33 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
     current_stage: str | None = None
     current_stage_t0: float | None = None
     last_progress_pct: float = -1.0
+    last_event_time: float = time.monotonic()
     run_t0 = time.monotonic()
 
     async def emit(event: dict) -> None:
+        nonlocal last_event_time
+        last_event_time = time.monotonic()
         await task.events.put(event)
+
+    async def stall_watchdog() -> None:
+        """Emit a warning if no progress event arrives for 60+ seconds."""
+        while task.status == "running":
+            await asyncio.sleep(30)
+            if task.status != "running":
+                break
+            gap = time.monotonic() - last_event_time
+            if gap > 60:
+                log.warning(
+                    "[%s] stalled: no progress event for %.0fs (stage=%s)",
+                    task.task_id, gap, current_stage or "?",
+                )
+                await task.events.put({
+                    "type": "progress_stall",
+                    "elapsed_since_last_event": round(gap, 1),
+                    "current_stage": current_stage or "unknown",
+                })
+
+    stall_task = asyncio.create_task(stall_watchdog())
 
     async def emit_perf(reason: str) -> None:
         await emit({
@@ -453,7 +513,16 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
             etype = event.get("type")
 
             # ----- stage timing --------------------------------------------
-            if etype == "progress_start":
+            if etype == "stage_summary":
+                # Log the full stage list with estimated weights on first arrival.
+                stages = event.get("stages", [])
+                if stages:
+                    stage_list = ", ".join(
+                        f"{s.get('name','?')}({s.get('percent',0)*100:.0f}%)"
+                        for s in stages
+                    )
+                    log.info("[%s]   pipeline stages: %s", task.task_id, stage_list)
+            elif etype == "progress_start":
                 new_stage = event.get("stage", "?")
                 stage_total = event.get("stage_total")
                 if new_stage != current_stage:
@@ -466,39 +535,60 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
                         )
                     current_stage = new_stage
                     current_stage_t0 = time.monotonic()
+                    # Include cumulative elapsed so users can gauge how far
+                    # through the pipeline they are.
+                    cum = round(time.monotonic() - run_t0, 1)
                     log.info(
-                        "[%s]   stage START %s (total=%s)",
-                        task.task_id, current_stage, stage_total,
+                        "[%s]   stage START %s | total_items=%s | cumulative_elapsed=%.1fs",
+                        task.task_id, current_stage, stage_total, cum,
                     )
+                    last_progress_pct = -1.0  # reset for new stage
             elif etype == "progress_end":
                 if current_stage is not None and current_stage_t0 is not None:
                     elapsed = time.monotonic() - current_stage_t0
                     perf[current_stage] = perf.get(current_stage, 0.0) + elapsed
+                    items = event.get("stage_total", 0)
+                    rate = f"{items / elapsed:.1f} items/s" if elapsed > 0 and items else ""
                     log.info(
-                        "[%s]   stage END  %s (%.2fs, items=%s)",
+                        "[%s]   stage END  %s (%.2fs, items=%s)%s",
                         task.task_id, current_stage, elapsed,
-                        event.get("stage_total"),
+                        items, f" | {rate}" if rate else "",
                     )
             elif etype == "progress_update":
-                # Throttle: log only on integer-percent transitions, not every
-                # progress event (those come at report_interval cadence).
                 pct = event.get("overall_progress")
                 if isinstance(pct, (int, float)):
                     int_pct = int(pct)
-                    if int_pct != last_progress_pct and int_pct % 5 == 0:
+                    # Log at every 10% transition (or every 5% for stages with
+                    # few items), but always include stage-elapsed time.
+                    sc = event.get("stage_current", 0)
+                    st = event.get("stage_total", 0)
+                    threshold = 5 if st <= 20 else 10
+                    if int_pct != last_progress_pct and int_pct % threshold == 0:
+                        stage_elapsed = (
+                            f"stage_elapsed={time.monotonic() - current_stage_t0:.1f}s"
+                            if current_stage_t0 else ""
+                        )
+                        rate_info = ""
+                        if current_stage_t0 and sc > 0:
+                            rate = sc / (time.monotonic() - current_stage_t0)
+                            rate_info = f" | {rate:.1f} items/s"
                         log.info(
-                            "[%s]     progress %s: %d%% (%d/%d) | stage=%s",
+                            "[%s]     %s: %d%% (%d/%d)%s | %s",
                             task.task_id,
                             current_stage or "?",
-                            int_pct,
-                            event.get("stage_current", 0),
-                            event.get("stage_total", 0),
-                            event.get("stage"),
+                            int_pct, sc, st,
+                            rate_info,
+                            stage_elapsed,
                         )
                         last_progress_pct = int_pct
 
             # ----- fan-out to SSE ------------------------------------------
             event_out = {k: v for k, v in event.items() if k != "translate_result"}
+            # Augment progress events with timing info for the UI.
+            if etype in ("progress_start", "progress_update", "progress_end"):
+                event_out["total_elapsed"] = round(time.monotonic() - run_t0, 1)
+                if current_stage_t0 is not None:
+                    event_out["stage_elapsed"] = round(time.monotonic() - current_stage_t0, 1)
             if etype == "finish":
                 res = event["translate_result"]
                 task.result = {
@@ -548,7 +638,8 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
         task.status = "cancelled"
         await emit_perf("cancelled")
         await emit({"type": "cancelled", "task_id": task.task_id})
-        raise
+        # Do not re-raise — during shutdown the event loop may already be
+        # tearing down, and re-raising just produces an unhelpful traceback.
     except Exception as exc:  # noqa: BLE001
         if current_stage is not None and current_stage_t0 is not None:
             elapsed = time.monotonic() - current_stage_t0
@@ -564,6 +655,7 @@ async def run_translation(task: Task, lang_in: str, lang_out: str) -> None:
     else:
         await emit_perf("done")
     finally:
+        stall_task.cancel()
         await task.events.put(None)  # sentinel
 
 
@@ -575,7 +667,22 @@ async def lifespan(app: FastAPI):
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     await get_config()
-    yield
+    try:
+        yield
+    finally:
+        # Cancel all in-flight translation tasks so the thread pool and
+        # subprocesses are released before the process exits.
+        async with TASK_LOCK:
+            for task_id, task in list(TASKS.items()):
+                if task.asyncio_task and not task.asyncio_task.done():
+                    task.asyncio_task.cancel()
+                    log.info("[%s] cancelled due to server shutdown", task_id)
+        # Give tasks a brief window to finish their cleanup.
+        pending = [t.asyncio_task for t in TASKS.values()
+                   if t.asyncio_task and not t.asyncio_task.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=3)
+        TASKS.clear()
 
 
 app = FastAPI(title="PDF Translator", lifespan=lifespan)
@@ -617,11 +724,27 @@ async def api_translate(
     pdf_path = UPLOAD_DIR / f"{task_id}.pdf"
     out_dir = OUTPUT_DIR / task_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    with pdf_path.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
-    log.info("Saved upload %s -> %s", file.filename, pdf_path)
+
+    # Write the uploaded file via the default thread pool so the event loop
+    # stays free to serve SSE connections and health checks.
+    loop = asyncio.get_running_loop()
+
+    def _save_upload() -> None:
+        with pdf_path.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+    await loop.run_in_executor(None, _save_upload)
+    log.info("Saved upload %s -> %s (%.1f MB)", file.filename, pdf_path,
+             pdf_path.stat().st_size / (1024 * 1024))
 
     task = Task(task_id, pdf_path, out_dir)
+    # Push an immediate event so the UI shows feedback even before the first
+    # babeldoc progress callback fires.
+    await task.events.put({
+        "type": "started",
+        "task_id": task_id,
+        "filename": file.filename,
+    })
     async with TASK_LOCK:
         TASKS[task_id] = task
         task.asyncio_task = asyncio.create_task(run_translation(task, lang_in, lang_out))
@@ -790,6 +913,7 @@ INDEX_HTML = """<!doctype html>
     <progress id="bar" value="0" max="100"></progress>
     <span id="pct" class="status">0%</span>
     <span id="stage" class="status"></span>
+    <span id="elapsed" class="status" style="display:none"></span>
   </div>
   <pre id="log"></pre>
   <div id="downloads"></div>
@@ -797,6 +921,16 @@ INDEX_HTML = """<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 const log = (m) => { const el = $("log"); el.textContent += m + "\\n"; el.scrollTop = el.scrollHeight; };
+let elapsedTimer = null;
+function startElapsed() {
+  const t0 = Date.now();
+  $("elapsed").style.display = "";
+  elapsedTimer = setInterval(() => {
+    const sec = Math.round((Date.now() - t0) / 1000);
+    $("elapsed").textContent = sec < 60 ? sec + "s" : Math.floor(sec/60) + "m" + (sec%60) + "s";
+  }, 1000);
+}
+function stopElapsed() { if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; } }
 
 $("go").addEventListener("click", async () => {
   const file = $("file").files[0];
@@ -807,11 +941,13 @@ $("go").addEventListener("click", async () => {
   $("downloads").innerHTML = "";
   $("log").textContent = "";
   $("bar").value = 0; $("pct").textContent = "0%";
+  $("stage").textContent = "";
+  stopElapsed();
   const fd = new FormData();
   fd.append("file", file);
   fd.append("lang_in", $("langIn").value);
   fd.append("lang_out", $("langOut").value);
-  log("Uploading " + file.name + " ...");
+  log("Uploading " + file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + " MB) ...");
   let r;
   try {
     r = await fetch("/api/translate", { method: "POST", body: fd });
@@ -835,16 +971,34 @@ $("go").addEventListener("click", async () => {
   const es = new EventSource("/api/tasks/" + task_id + "/events");
   es.onmessage = (ev) => {
     const e = JSON.parse(ev.data);
-    if (e.type === "progress_start") {
-      $("stage").textContent = e.stage + " (0/" + e.stage_total + ")";
+    if (e.type === "started") {
+      log("Translation started – " + (e.filename || ""));
+      startElapsed();
+    } else if (e.type === "stage_summary") {
+      // Show the pipeline stages with their estimated weight percentages.
+      const stages = e.stages || [];
+      if (stages.length) {
+        const names = stages.map(s => s.name + " (~" + Math.round(s.percent * 100) + "%)").join(" → ");
+        log("Pipeline: " + names);
+      }
+    } else if (e.type === "progress_start") {
+      const extra = e.total_elapsed ? " | total=" + e.total_elapsed.toFixed(0) + "s" : "";
+      $("stage").textContent = e.stage + " (0/" + e.stage_total + ")" + extra;
     } else if (e.type === "progress_update") {
       if (typeof e.overall_progress === "number") {
         $("bar").value = e.overall_progress;
         $("pct").textContent = e.overall_progress.toFixed(1) + "%";
       }
-      $("stage").textContent = e.stage + " (" + e.stage_current + "/" + e.stage_total + ")";
+      let info = e.stage + " (" + e.stage_current + "/" + e.stage_total + ")";
+      if (e.stage_elapsed) info += " | stage=" + e.stage_elapsed.toFixed(0) + "s";
+      if (e.total_elapsed) info += " total=" + e.total_elapsed.toFixed(0) + "s";
+      $("stage").textContent = info;
     } else if (e.type === "progress_end") {
-      $("stage").textContent = e.stage + " done";
+      const extra = e.total_elapsed ? " | total=" + e.total_elapsed.toFixed(0) + "s" : "";
+      $("stage").textContent = e.stage + " done" + extra;
+    } else if (e.type === "progress_stall") {
+      log("⚠ stalled: no progress for " + e.elapsed_since_last_event.toFixed(0)
+          + "s (stage: " + (e.current_stage || "?") + ")");
     } else if (e.type === "finish") {
       $("bar").value = 100; $("pct").textContent = "100%";
       log("Done in " + e.result.total_seconds.toFixed(1) + "s");
@@ -862,14 +1016,17 @@ $("go").addEventListener("click", async () => {
         a.download = "";
         div.appendChild(a);
       }
+      stopElapsed();
       es.close();
       finishClient();
     } else if (e.type === "cancelled") {
       log("Cancelled by user");
+      stopElapsed();
       es.close();
       finishClient();
     } else if (e.type === "error") {
       log("ERROR: " + e.error);
+      stopElapsed();
       es.close();
       finishClient();
     } else if (e.type === "perf") {
@@ -882,7 +1039,7 @@ $("go").addEventListener("click", async () => {
       log("event: " + e.type);
     }
   };
-  es.onerror = () => { log("SSE connection closed"); finishClient(); };
+  es.onerror = () => { log("SSE connection closed"); stopElapsed(); finishClient(); };
 });
 
 function finishClient() {
@@ -905,10 +1062,33 @@ async def index():
 # CLI entry
 # ---------------------------------------------------------------------------
 def main():
+    import signal
+
     import uvicorn
+
     cfg = load_config(CONFIG_PATH)  # fail fast on bad config
     log.info("active_model=%s, host=%s, port=%d", cfg.active_model, cfg.host, cfg.port)
-    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
+
+    # Suppress the default SIGINT handler so Ctrl-C produces a clean exit
+    # instead of a KeyboardInterrupt traceback.
+    interrupted = False
+
+    def _handle_sigint(signum, frame):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            log.info("Received Ctrl-C, shutting down gracefully ...")
+        else:
+            log.warning("Second Ctrl-C received, forcing exit")
+            raise KeyboardInterrupt
+
+    original_handler = signal.signal(signal.SIGINT, _handle_sigint)
+    try:
+        uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
+    except KeyboardInterrupt:
+        log.info("Server stopped")
+    finally:
+        signal.signal(signal.SIGINT, original_handler)
 
 
 if __name__ == "__main__":
