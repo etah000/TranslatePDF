@@ -3,7 +3,7 @@
   "claudecode": {
     "translate_engine_type": "claude",
     "claude_code_path": "/home/frank/.local/bin/claude",
-    "claude_code_model": "sonnet"
+    "claude_code_model": "haiku"
   },
   "translation": {
     "qps": 3,
