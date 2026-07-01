@@ -253,7 +253,11 @@ class ClaudeCodeTranslator(BaseTranslator):
             )
             stdout, stderr = proc.communicate(
                 input=json.dumps({"type": "user", "message": messages[0]}),
-                timeout=120,
+                # Align with cc-switch's non_streaming_timeout (600s) so the
+                # client doesn't cut off the stream-json mid-line when an
+                # upstream provider is slow or retrying failover — a partial
+                # read is what produced the "Expecting ',' delimiter" errors.
+                timeout=600,
             )
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -288,7 +292,14 @@ def _get_configured_models() -> list[str]:
         if key not in _TRANSLATION_KEYS
         and key != "active_model"
         and isinstance(raw[key], dict)
-        and ("openai_api_key" in raw[key] or "claude_code_path" in raw[key])
+        and (
+            "openai_api_key" in raw[key]
+            or "claude_code_path" in raw[key]
+            # Key-less entries routed through a local proxy (cc-switch) —
+            # matched on the same signals as AppConfig.__init__.
+            or raw[key].get("translate_engine_type") == "openapi"
+            or "openai_base_url" in raw[key]
+        )
     ]
 # Defaults for the UI (lang_in=en, lang_out=zh). Both can be overridden
 # per-request; values must come from the whitelists below.
@@ -356,6 +367,7 @@ class Task:
         "events", "result", "error", "asyncio_task",
         "lang_in", "lang_out", "model_override",
         "pause_event",  # threading.Event — set when paused
+        "_cached_il",   # model-switch resume: IL snapshot captured at Translate stage start
     )
 
     def __init__(self, task_id: str, pdf_path: Path, output_dir: Path,
@@ -375,6 +387,7 @@ class Task:
         self.pause_event = threading.Event()
         self.pause_event.set()  # start in "not paused" state
         # pause_event.is_set() → not paused; pause_event.wait() blocks when paused
+        self._cached_il = None
 
 
 TASKS: dict[str, Task] = {}
@@ -393,7 +406,20 @@ class AppConfig:
         # it knows about; defaults below match what OpenAISettings /
         # ClaudeCodeSettings used to provide.
         model_cfg = raw.get(self.active_model, {})
-        if isinstance(model_cfg, dict) and "openai_api_key" in model_cfg:
+        # Branch on engine type, not on the presence of a key: when we route
+        # through a local proxy (e.g. cc-switch), the proxy authenticates on
+        # our behalf and we don't need to ship a real key in config.
+        # `translate_engine_type` is the explicit signal; absent → legacy
+        # branch detection (kept for backwards compat).
+        is_openai_engine = (
+            isinstance(model_cfg, dict)
+            and (
+                model_cfg.get("translate_engine_type") == "openapi"
+                or "openai_base_url" in model_cfg
+                or "openai_api_key" in model_cfg
+            )
+        )
+        if is_openai_engine:
             self.engine: dict = {
                 "openai_model":         "gpt-4o-mini",
                 "openai_base_url":      None,
@@ -406,18 +432,21 @@ class AppConfig:
                 "openai_enable_json_mode": False,
                 **model_cfg,
             }
+            # cc-switch / local-proxy setups ship without a key because the
+            # proxy handles auth.  The OpenAI SDK still requires a non-empty
+            # string here, so fall back to a placeholder.
             if not self.engine["openai_api_key"]:
-                raise ValueError(f"{self.active_model}.openai_api_key is required")
+                self.engine["openai_api_key"] = "cc-switch"
             if self.engine["openai_timeout"] is not None:
                 float(self.engine["openai_timeout"])  # raises if invalid
         else:
             self.engine: dict = {
                 "claude_code_path":  "claude",
                 "claude_code_model": "sonnet",
-                **raw.get("claudecode", {}),
+                **model_cfg,
             }
             if not self.engine["claude_code_path"]:
-                raise ValueError("claudecode.claude_code_path is required")
+                raise ValueError(f"{self.active_model}.claude_code_path is required")
         # Translation defaults
         tr = raw.get("translation", {})
         self.qps: int = int(tr.get("qps", 4))
@@ -497,32 +526,14 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
                          model_override: str | None = None) -> None:
     cfg = await get_config()
     if model_override and model_override != cfg.active_model:
-        # Build a transient config for the requested model, reusing the same
-        # translation/server settings from config.json.
-        import copy
-        cfg = copy.copy(cfg)
-        cfg.active_model = model_override
-        # engine dict is populated by __init__ based on active_model — redo.
+        # Build a transient config for the requested model by reconstructing
+        # AppConfig with a swapped active_model.  This reuses the exact engine
+        # branch/validation logic from __init__ instead of duplicating it here
+        # (which previously only checked for openai_api_key and missed
+        # key-less cc-switch / openapi providers).
         raw = json.loads(CONFIG_PATH.read_bytes())
-        if "openai_api_key" in raw.get(model_override, {}):
-            cfg.engine = {
-                "openai_model":         "gpt-4o-mini",
-                "openai_base_url":      None,
-                "openai_api_key":       None,
-                "openai_timeout":       None,
-                "openai_temperature":   None,
-                "openai_reasoning_effort": None,
-                "openai_send_temprature":   False,
-                "openai_send_reasoning_effort": False,
-                "openai_enable_json_mode": False,
-                **raw.get(model_override, {}),
-            }
-        else:
-            cfg.engine = {
-                "claude_code_path":  "claude",
-                "claude_code_model": "sonnet",
-                **raw.get(model_override, {}),
-            }
+        raw["active_model"] = model_override
+        cfg = AppConfig(raw)
 
     settings = cfg.build_settings()
     translator = make_translator(cfg, settings, lang_in, lang_out)
@@ -550,10 +561,9 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
         auto_extract_glossary=False,  # term extraction is slow; default off
     )
     # Reuse in-memory IL from a previous run (model-switch resume path).
-    cached = getattr(task, "_cached_il", None)
-    if cached is not None:
-        config.cached_il = cached
-        del task._cached_il  # one-shot
+    if task._cached_il is not None:
+        config.cached_il = task._cached_il
+        task._cached_il = None  # one-shot
     task.status = "running"
 
     fm = _file_meta(task.pdf_path)
