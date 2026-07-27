@@ -1,12 +1,23 @@
 {
-  "active_model": "claudecode",
+  "active_model": "cc_switch_nvidia",
   "claudecode": {
     "translate_engine_type": "claude",
     "claude_code_path": "/home/frank/.local/bin/claude",
     "claude_code_model": "haiku"
   },
+  "cc_switch_nvidia": {
+    "translate_engine_type": "openapi",
+    "openai_base_url": "https://integrate.api.nvidia.com/v1",
+    "openai_api_key": "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",
+    "openai_model": "deepseek-ai/deepseek-v4-flash",
+    "openai_timeout": "120",
+    "openai_temperature": "1",
+    "openai_send_temprature": true,
+    "openai_extra_body": "{\"chat_template_kwargs\":{\"thinking\":false}}"
+  },
   "translation": {
-    "qps": 3,
+    "qps": 0,
+    "workers": 1,
     "ignore_cache": false,
     "no_dual": false,
     "no_mono": false,

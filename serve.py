@@ -92,8 +92,25 @@ class OpenAITranslator(BaseTranslator):
             self.add_cache_impact_parameters("reasoning_effort", self.options["reasoning_effort"])
         if settings.openai_enable_json_mode:
             self.add_cache_impact_parameters("enable_json_mode", True)
+        # extra_body is a JSON-encoded string in config (for readability when
+        # nesting deep provider-specific options like NVIDIA's
+        # chat_template_kwargs). Parse it once at init so per-call paths
+        # don't pay the cost, and fail fast on bad JSON.
+        raw_extra_body = getattr(settings, "openai_extra_body", None)
+        if raw_extra_body:
+            try:
+                self.options["extra_body"] = json.loads(raw_extra_body)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"openai_extra_body is not valid JSON: {e}"
+                ) from e
         self.add_cache_impact_parameters("model", self.model)
         self.add_cache_impact_parameters("prompt", _translation_prompt("", self.lang_out)[0]["content"])
+        # Per-instance stats for the per-call INFO log. BabelDOC runs _call
+        # from a worker pool (translator.py:135), so the rate-limit counter
+        # can be bumped from multiple threads concurrently.
+        self._rate_limit_count = 0
+        self._rate_limit_lock = threading.Lock()
 
     @staticmethod
     def _remove_cot_content(text: str) -> str:
@@ -127,6 +144,7 @@ class OpenAITranslator(BaseTranslator):
         # Quota-exhausted (insufficient_quota) is NOT retried — it won't
         # recover without human intervention.
         max_retries = 5
+        t0 = time.monotonic()
         for attempt in range(1, max_retries + 1):
             try:
                 r = self.client.chat.completions.create(
@@ -134,6 +152,8 @@ class OpenAITranslator(BaseTranslator):
                 )
                 break
             except _openai.RateLimitError as e:
+                with self._rate_limit_lock:
+                    self._rate_limit_count += 1
                 body = getattr(e, "body", None) or {}
                 if isinstance(body, dict):
                     inner = body.get("error", body)
@@ -156,6 +176,22 @@ class OpenAITranslator(BaseTranslator):
                     raise
                 wait = min(2 ** attempt, 30)
                 time.sleep(wait)
+
+        # One log line per actual LLM call so we can see latency / 429
+        # frequency / cache-vs-real-call ratio downstream. Each entry into
+        # _call is a real network call (cache hits short-circuit before
+        # here in BabelDOC's BaseTranslator.translate).
+        dur = time.monotonic() - t0
+        with self._rate_limit_lock:
+            rl_count = self._rate_limit_count
+        usage = getattr(r, "usage", None)
+        in_tok = getattr(usage, "prompt_tokens", -1) if usage else -1
+        out_tok = getattr(usage, "completion_tokens", -1) if usage else -1
+        log.info(
+            "llm_call #%d dur=%.2fs in=%d out=%d finish=%s rate_limit_hits=%d",
+            self.translate_call_count, dur, in_tok, out_tok,
+            r.choices[0].finish_reason, rl_count,
+        )
 
         choice = r.choices[0]
         content = getattr(choice.message, "content", None)
@@ -430,6 +466,7 @@ class AppConfig:
                 "openai_send_temprature":   False,
                 "openai_send_reasoning_effort": False,
                 "openai_enable_json_mode": False,
+                "openai_extra_body":    None,
                 **model_cfg,
             }
             # cc-switch / local-proxy setups ship without a key because the
@@ -449,7 +486,17 @@ class AppConfig:
                 raise ValueError(f"{self.active_model}.claude_code_path is required")
         # Translation defaults
         tr = raw.get("translation", {})
+        # qps: rate limit on outbound API calls. 0 = unlimited.
+        # workers: parallel translation workers inside BabelDOC.
+        # They used to be coupled (both = qps), but rate-limiting a slow API
+        # at e.g. qps=1 leaves the worker pool stuck at 1 even when the
+        # provider can handle more concurrency — so we split them.
         self.qps: int = int(tr.get("qps", 4))
+        self.workers: int = int(tr.get("workers", 1))
+        if self.workers < 1:
+            raise ValueError(f"translation.workers must be >= 1, got {self.workers}")
+        if self.qps < 0:
+            raise ValueError(f"translation.qps must be >= 0, got {self.qps}")
         self.ignore_cache: bool = bool(tr.get("ignore_cache", False))
         self.no_dual: bool = bool(tr.get("no_dual", False))
         self.no_mono: bool = bool(tr.get("no_mono", False))
@@ -541,7 +588,10 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
     # Wire the pause event into both translators so they block before API calls.
     translator._pause_event = task.pause_event
     term_translator._pause_event = task.pause_event
-    set_translate_rate_limiter(max(1, cfg.qps))
+    # qps=0 means "no rate limit" — pass a very high cap (1000) so the
+    # BabelDOC limiter's `max_qps > 0` check still passes but effectively
+    # never sleeps.
+    set_translate_rate_limiter(cfg.qps if cfg.qps > 0 else 1000)
 
     config = TranslationConfig(
         input_file=task.pdf_path,
@@ -552,7 +602,7 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
         lang_out=lang_out,
         doc_layout_model=None,
         qps=cfg.qps,
-        pool_max_workers=cfg.qps,
+        pool_max_workers=cfg.workers,
         no_dual=cfg.no_dual,
         no_mono=cfg.no_mono,
         watermark_output_mode=WATERMARK_MAP[cfg.watermark_str],
@@ -568,14 +618,16 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
 
     fm = _file_meta(task.pdf_path)
     log.info(
-        "[%s] translation start | engine=%s | model=%s | %s→%s | qps=%d | "
+        "[%s] translation start | engine=%s | model=%s | %s→%s | qps=%s | workers=%d | "
         "watermark=%s | no_dual=%s | no_mono=%s | file=%s (%.2f MB)",
         task.task_id,
         cfg.active_model,
         getattr(cfg, "engine", {}).get(
                 "openai_model" if "openai_api_key" in getattr(cfg, "engine", {}) else "claude_code_model",
                 "?"),
-        lang_in, lang_out, cfg.qps,
+        lang_in, lang_out,
+        cfg.qps if cfg.qps > 0 else "unlimited",
+        cfg.workers,
         cfg.watermark_str, cfg.no_dual, cfg.no_mono,
         task.pdf_path.name, fm.get("size_mb", 0.0),
     )

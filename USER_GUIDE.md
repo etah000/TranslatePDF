@@ -150,6 +150,7 @@ pointed at by changing `openai_base_url` and `openai_model`.
 | `openai_reasoning_effort` | string \| null | `null` | One of `minimal` / `low` / `medium` / `high`. Only sent if `openai_send_reasoning_effort` is `true`. Used by reasoning models. |
 | `openai_send_reasoning_effort` | bool | `false` | If `true`, include `openai_reasoning_effort` in the request. |
 | `openai_enable_json_mode` | bool | `false` | Enable JSON-object response mode. Generally leave `false` for translation; some providers require it for term extraction. |
+| `openai_extra_body` | string \| null | `null` | JSON-encoded payload forwarded as `extra_body=` to `chat.completions.create`. Use it for provider-specific options that aren't covered by the keys above. Example for NVIDIA's `deepseek-ai/deepseek-v4-pro` (and other deepseek-r1/v4 reasoning models): turn off chain-of-thought so each call returns a translation directly instead of a <think>…</think> block, saving 3-5× tokens: `"{\"chat_template_kwargs\":{\"thinking\":false}}"`. Invalid JSON causes the service to refuse to start. |
 
 ### 3.3 ClaudeCode engine
 
@@ -166,7 +167,8 @@ done by shelling out to the `claude` CLI.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `qps` | int | `4` | Queries-per-second cap for the LLM. Internal QPS limiter sleeps between requests. Set to `0` to disable. |
+| `qps` | int | `4` | Queries-per-second cap for the LLM. Internal QPS limiter sleeps between requests. Set to `0` to disable the cap. |
+| `workers` | int | `1` | Number of parallel translation workers inside BabelDOC. Independent of `qps` — e.g. `qps=1` + `workers=4` serialises outbound calls but still parallelises PDF-internal work. Must be `>= 1`. |
 | `ignore_cache` | bool | `false` | If `true`, every text is re-translated even if it has been translated before. Translation results are stored at `~/.cache/pdf2zh_next/cache.v1.db` regardless. |
 | `no_dual` | bool | `false` | Skip generating the **bilingual** PDF (original + translated side-by-side). |
 | `no_mono` | bool | `false` | Skip generating the **monolingual translated-only** PDF. At least one of `no_dual` / `no_mono` must be `false`. |
@@ -319,10 +321,14 @@ Or reinstall the project: `pip install -e .`
   fonts/layout-model assets. Subsequent translations of any PDF are
   much faster.
 - Long PDFs are auto-split into parts internally; each part is
-  translated in parallel up to `qps` concurrent requests.
+  translated in parallel up to `workers` concurrent workers, with the
+  outbound API rate capped at `qps` requests/sec.
 - Disable `auto_extract_glossary` (already off by default in this service)
   to skip a full extra LLM pass.
-- If you are rate-limited (HTTP 429), lower `qps` in `config.json`.
+- If you are rate-limited (HTTP 429), lower `qps` in `config.json`. For
+  free-tier providers (e.g. NVIDIA's 40 req/min limit) start with
+  `qps=1, workers=1` and only raise `workers` once you confirm the
+  provider tolerates the concurrency.
 
 ### "Claude Code CLI not found at 'claude'"
 
