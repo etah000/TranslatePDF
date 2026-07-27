@@ -169,6 +169,8 @@ done by shelling out to the `claude` CLI.
 |---|---|---|---|
 | `qps` | int | `4` | Queries-per-second cap for the LLM. Internal QPS limiter sleeps between requests. Set to `0` to disable the cap. |
 | `workers` | int | `1` | Number of parallel translation workers inside BabelDOC. Independent of `qps` — e.g. `qps=1` + `workers=4` serialises outbound calls but still parallelises PDF-internal work. Must be `>= 1`. |
+| `quota_wait` | bool | `true` | If `true`, when the provider reports the account/tier quota as exhausted (`insufficient_quota`), the task **blocks and re-checks** on an interval until the quota refreshes, instead of failing. Ideal for free tiers with per-minute/daily windows. Set to `false` to fail fast (legacy behaviour). |
+| `quota_wait_interval` | int | `300` | Seconds between quota re-checks when `quota_wait` is `true`. Default is 5 minutes. Must be `>= 1`. A `WARNING` log line is emitted each time the task parks. The wait is interruptible — cancelling the task aborts it promptly. |
 | `ignore_cache` | bool | `false` | If `true`, every text is re-translated even if it has been translated before. Translation results are stored at `~/.cache/pdf2zh_next/cache.v1.db` regardless. |
 | `no_dual` | bool | `false` | Skip generating the **bilingual** PDF (original + translated side-by-side). |
 | `no_mono` | bool | `false` | Skip generating the **monolingual translated-only** PDF. At least one of `no_dual` / `no_mono` must be `false`. |
@@ -329,6 +331,12 @@ Or reinstall the project: `pip install -e .`
   free-tier providers (e.g. NVIDIA's 40 req/min limit) start with
   `qps=1, workers=1` and only raise `workers` once you confirm the
   provider tolerates the concurrency.
+- If the provider reports the **quota is exhausted** (`insufficient_quota`),
+  the task no longer fails by default — with `quota_wait: true` it parks and
+  re-checks every `quota_wait_interval` seconds (default 300 = 5 min) until
+  the quota window refreshes, then resumes automatically from where it left
+  off (completed paragraphs are cached). Watch for the `quota exhausted …
+  waiting Ns` `WARNING` in the logs. Cancel the task to abort the wait.
 
 ### "Claude Code CLI not found at 'claude'"
 

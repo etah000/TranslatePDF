@@ -70,6 +70,38 @@ def _check_pause(translator):
         ev.wait()
 
 
+class TranslationCancelled(Exception):
+    """Raised inside a worker thread when the task is cancelled while the
+    thread is blocked in a long wait (quota wait / back-off).
+
+    An ``asyncio.Task.cancel()`` cannot interrupt a thread that is sleeping
+    in a thread-pool worker, so we cooperatively poll ``stop_event`` and
+    raise this to unwind the BabelDOC pipeline promptly."""
+
+
+def _interruptible_wait(total_seconds: float, stop_event, *,
+                        poll: float = 1.0) -> None:
+    """Sleep up to ``total_seconds`` but wake immediately if ``stop_event``
+    is set, raising :class:`TranslationCancelled`.
+
+    Sleeping in small ``poll`` slices keeps a multi-minute quota wait
+    responsive to cancellation (the asyncio cancel path sets ``stop_event``).
+    """
+    if stop_event is not None and stop_event.is_set():
+        raise TranslationCancelled()
+    if stop_event is None:
+        time.sleep(total_seconds)
+        return
+    deadline = time.monotonic() + total_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        # Event.wait returns True as soon as the flag is set — no busy loop.
+        if stop_event.wait(timeout=min(poll, remaining)):
+            raise TranslationCancelled()
+
+
 class OpenAITranslator(BaseTranslator):
     """OpenAI / OpenAI-compatible chat-completions translator."""
 
@@ -111,6 +143,18 @@ class OpenAITranslator(BaseTranslator):
         # can be bumped from multiple threads concurrently.
         self._rate_limit_count = 0
         self._rate_limit_lock = threading.Lock()
+        # Quota-wait behaviour. When the provider reports the account/tier
+        # quota as exhausted we can either fail fast (legacy) or block and
+        # re-check on an interval until the quota refreshes (default). These
+        # are overwritten per-run in run_translation from the config; the
+        # defaults here keep the translator usable standalone.
+        self._quota_wait: bool = True
+        self._quota_wait_interval: int = 300  # seconds between re-checks
+        # Cancellation signal for the worker thread. When set, any blocking
+        # wait inside _call (quota wait / back-off) aborts instead of
+        # holding the thread hostage — the asyncio-level cancel can't reach a
+        # thread that's sleeping. Wired to Task.stop_event in run_translation.
+        self._stop_event: threading.Event | None = None
 
     @staticmethod
     def _remove_cot_content(text: str) -> str:
@@ -140,12 +184,20 @@ class OpenAITranslator(BaseTranslator):
         if response_format_json and self.options.get("enable_json_mode"):
             opts["response_format"] = {"type": "json_object"}
 
-        # Retry on transient rate-limit errors with exponential back-off.
-        # Quota-exhausted (insufficient_quota) is NOT retried — it won't
-        # recover without human intervention.
+        # Retry policy:
+        #  - Ordinary rate limits (HTTP 429, no quota code): bounded
+        #    exponential back-off, then give up.
+        #  - Quota exhaustion (insufficient_quota): if _quota_wait is on
+        #    (default), block and re-check every _quota_wait_interval seconds
+        #    until the provider's quota window refreshes; otherwise fail fast.
+        #    Quota waits don't consume the bounded retry budget, so a task can
+        #    park indefinitely waiting for a free-tier daily/minute reset.
+        #  All blocking waits are interruptible via _stop_event so a cancel
+        #  unwinds the worker thread promptly.
         max_retries = 5
+        attempt = 0
         t0 = time.monotonic()
-        for attempt in range(1, max_retries + 1):
+        while True:
             try:
                 r = self.client.chat.completions.create(
                     model=self.model, **opts, messages=messages,
@@ -166,16 +218,29 @@ class OpenAITranslator(BaseTranslator):
                 else:
                     code = ""
                     msg = str(e)
-                # Quota exhaustion — no point retrying.
-                if code == "insufficient_quota" or "insufficient_quota" in msg:
-                    raise RuntimeError(
-                        f"API quota exhausted for model '{self.model}'."
-                        f" Switch to a different model or top up your account."
-                    ) from e
-                if attempt == max_retries:
+                is_quota = code == "insufficient_quota" or "insufficient_quota" in msg
+                if is_quota:
+                    if not self._quota_wait:
+                        raise RuntimeError(
+                            f"API quota exhausted for model '{self.model}'."
+                            f" Switch to a different model or top up your account."
+                        ) from e
+                    # Park until the quota window refreshes. Log at WARNING so
+                    # a stuck task is visible without tailing DEBUG.
+                    log.warning(
+                        "quota exhausted for model '%s'; waiting %ds before "
+                        "re-checking (task will resume automatically when the "
+                        "quota refreshes)",
+                        self.model, self._quota_wait_interval,
+                    )
+                    _interruptible_wait(self._quota_wait_interval, self._stop_event)
+                    continue  # does NOT count against max_retries
+                # Ordinary rate limit — bounded back-off.
+                attempt += 1
+                if attempt >= max_retries:
                     raise
                 wait = min(2 ** attempt, 30)
-                time.sleep(wait)
+                _interruptible_wait(wait, self._stop_event)
 
         # One log line per actual LLM call so we can see latency / 429
         # frequency / cache-vs-real-call ratio downstream. Each entry into
@@ -403,6 +468,7 @@ class Task:
         "events", "result", "error", "asyncio_task",
         "lang_in", "lang_out", "model_override",
         "pause_event",  # threading.Event — set when paused
+        "stop_event",   # threading.Event — set on cancel to abort worker-thread waits
         "_cached_il",   # model-switch resume: IL snapshot captured at Translate stage start
     )
 
@@ -423,6 +489,7 @@ class Task:
         self.pause_event = threading.Event()
         self.pause_event.set()  # start in "not paused" state
         # pause_event.is_set() → not paused; pause_event.wait() blocks when paused
+        self.stop_event = threading.Event()  # set on cancel → aborts worker waits
         self._cached_il = None
 
 
@@ -497,6 +564,17 @@ class AppConfig:
             raise ValueError(f"translation.workers must be >= 1, got {self.workers}")
         if self.qps < 0:
             raise ValueError(f"translation.qps must be >= 0, got {self.qps}")
+        # Quota exhaustion handling. When quota_wait is true (default) a task
+        # blocks and re-checks every quota_wait_interval seconds until the
+        # provider's quota refreshes, instead of failing. Useful for free
+        # tiers with per-minute/day windows (e.g. NVIDIA).
+        self.quota_wait: bool = bool(tr.get("quota_wait", True))
+        self.quota_wait_interval: int = int(tr.get("quota_wait_interval", 300))
+        if self.quota_wait_interval < 1:
+            raise ValueError(
+                f"translation.quota_wait_interval must be >= 1, "
+                f"got {self.quota_wait_interval}"
+            )
         self.ignore_cache: bool = bool(tr.get("ignore_cache", False))
         self.no_dual: bool = bool(tr.get("no_dual", False))
         self.no_mono: bool = bool(tr.get("no_mono", False))
@@ -588,6 +666,16 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
     # Wire the pause event into both translators so they block before API calls.
     translator._pause_event = task.pause_event
     term_translator._pause_event = task.pause_event
+    # Wire cancellation + quota-wait config so a quota-exhausted task parks
+    # (re-checking every quota_wait_interval s) instead of failing, and a
+    # cancel can still interrupt that wait. Guarded with setattr-friendly
+    # attribute access so the ClaudeCode translator (which lacks these) is a
+    # no-op.
+    for _t in (translator, term_translator):
+        if isinstance(_t, OpenAITranslator):
+            _t._stop_event = task.stop_event
+            _t._quota_wait = cfg.quota_wait
+            _t._quota_wait_interval = cfg.quota_wait_interval
     # qps=0 means "no rate limit" — pass a very high cap (1000) so the
     # BabelDOC limiter's `max_qps > 0` check still passes but effectively
     # never sleeps.
@@ -820,6 +908,22 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
         await emit({"type": action, "task_id": task.task_id})
         # Do not re-raise — during shutdown the event loop may already be
         # tearing down, and re-raising just produces an unhelpful traceback.
+    except TranslationCancelled:
+        # A worker thread aborted a quota/back-off wait because stop_event was
+        # set (cancel path). Treat exactly like a cancel — the asyncio-level
+        # cancel may or may not have won the race, so handle it here too.
+        if current_stage is not None and current_stage_t0 is not None:
+            elapsed = time.monotonic() - current_stage_t0
+            perf[current_stage] = perf.get(current_stage, 0.0) + elapsed
+        if task.status not in ("paused",):
+            task.status = "cancelled"
+        action = task.status
+        log.warning(
+            "[%s] translation %s (worker wait interrupted) after %.2fs",
+            task.task_id, action.upper(), time.monotonic() - run_t0,
+        )
+        await emit_perf(action)
+        await emit({"type": action, "task_id": task.task_id})
     except Exception as exc:  # noqa: BLE001
         if current_stage is not None and current_stage_t0 is not None:
             elapsed = time.monotonic() - current_stage_t0
@@ -988,11 +1092,15 @@ async def api_task_cancel(task_id: str):
     if task.status == "paused":
         # Move from paused to cancelled.
         task.status = "cancelled"
+        task.stop_event.set()  # abort any in-flight worker-thread wait
         await task.events.put(
             {"type": "cancelled", "task_id": task_id})
         await task.events.put(None)
         return {"task_id": task_id, "status": "cancelled"}
     if task.asyncio_task and not task.asyncio_task.done():
+        # Set stop_event first so a worker thread parked in a quota/back-off
+        # wait unwinds; then cancel the asyncio task for the event-loop side.
+        task.stop_event.set()
         task.asyncio_task.cancel()
         log.info("Cancel requested for task %s", task_id)
     return {"task_id": task_id, "status": "cancelling"}

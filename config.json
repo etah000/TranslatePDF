@@ -18,6 +18,8 @@
   "translation": {
     "qps": 0,
     "workers": 1,
+    "quota_wait": true,
+    "quota_wait_interval": 300,
     "ignore_cache": false,
     "no_dual": false,
     "no_mono": false,
