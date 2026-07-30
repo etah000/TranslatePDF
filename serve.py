@@ -19,6 +19,9 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC
+from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -46,6 +49,7 @@ from floris.pdf_chunks import split_pdf_chunk
 from floris.pdf_jobs import BookJobManifest
 from floris.pdf_jobs import ChunkState
 from floris.pdf_jobs import cleanup_completed_chunk_dirs
+from floris.pdf_jobs import cleanup_stale_incomplete_jobs
 from floris.pdf_jobs import save_manifest
 from floris.uploads import resolve_upload_path
 
@@ -1145,6 +1149,13 @@ async def run_chunked_translation(
 async def lifespan(app: FastAPI):
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    removed_jobs = cleanup_stale_incomplete_jobs(
+        OUTPUT_DIR / "jobs",
+        now=datetime.now(UTC),
+        ttl=timedelta(days=7),
+    )
+    if removed_jobs:
+        log.info("Cleaned stale incomplete chunked jobs: %s", removed_jobs)
     await get_config()
     try:
         yield
