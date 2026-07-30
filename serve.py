@@ -40,12 +40,14 @@ from babeldoc.translator.translator import set_translate_rate_limiter
 
 from floris.glossary import ensure_book_glossary
 from floris.glossary import load_babeldoc_glossary
+from floris.pdf_chunks import count_pages
 from floris.pdf_chunks import merge_pdfs
 from floris.pdf_chunks import split_pdf_chunk
 from floris.pdf_jobs import BookJobManifest
 from floris.pdf_jobs import ChunkState
 from floris.pdf_jobs import cleanup_completed_chunk_dirs
 from floris.pdf_jobs import save_manifest
+from floris.uploads import resolve_upload_path
 
 
 # ---------------------------------------------------------------------------
@@ -1049,7 +1051,6 @@ async def _run_chunked_manifest(
             if parent_task is not None:
                 parent_task.status = "error"
                 parent_task.error = chunk.error
-                await parent_task.events.put({"type": "error", "error": chunk.error})
             return
         if parent_task is not None:
             await parent_task.events.put({
@@ -1089,7 +1090,52 @@ async def _run_chunked_manifest(
             else "",
             "total_seconds": 0.0,
         }
-        await parent_task.events.put({"type": "finish", "result": parent_task.result})
+
+
+async def run_chunked_translation(
+    task: Task,
+    lang_in: str,
+    lang_out: str,
+    model_override: str | None = None,
+    chunk_size: int = 50,
+) -> None:
+    run_t0 = time.monotonic()
+    try:
+        total_pages = count_pages(task.pdf_path)
+        manifest = BookJobManifest.new(
+            job_id=task.task_id,
+            source_pdf_path=task.pdf_path,
+            job_dir=task.output_dir,
+            chunk_size=chunk_size,
+            total_pages=total_pages,
+        )
+        await task.events.put({
+            "type": "chunked_started",
+            "task_id": task.task_id,
+            "chunk_size": chunk_size,
+            "total_pages": total_pages,
+            "total_chunks": len(manifest.chunks),
+        })
+        await _run_chunked_manifest(
+            manifest,
+            lang_in,
+            lang_out,
+            model_override,
+            task,
+        )
+        if task.result:
+            task.result["total_seconds"] = round(time.monotonic() - run_t0, 3)
+        if task.status == "done":
+            await task.events.put({"type": "finish", "result": task.result})
+        elif task.status == "error":
+            await task.events.put({"type": "error", "error": task.error})
+        await task.events.put(None)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("[%s] chunked translation FAILED: %s", task.task_id, exc)
+        task.status = "error"
+        task.error = str(exc)
+        await task.events.put({"type": "error", "error": str(exc)})
+        await task.events.put(None)
 
 
 # ---------------------------------------------------------------------------
@@ -1148,6 +1194,9 @@ async def api_translate(
     lang_in: str = Form(...),
     lang_out: str = Form(...),
     model: str = Form(""),  # optional — any model from config.json
+    chunked: str = Form("false"),
+    chunk_size: int = Form(50),
+    upload_policy: str = Form("reuse"),
 ):
     # Validate languages
     if lang_in not in ALLOWED_SOURCE_LANGS:
@@ -1162,35 +1211,33 @@ async def api_translate(
         )
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="file must be a PDF")
-
-    # Derive a safe stem from the original filename for human-readable outputs.
-    raw_stem = Path(file.filename).stem
-    safe_stem = re.sub(r"[^a-zA-Z0-9._-]", "_", raw_stem).strip("_") or "document"
-    # Avoid overwriting a previous upload / output with the same stem.
-    dedup = ""
-    while (UPLOAD_DIR / f"{safe_stem}{dedup}.pdf").exists() or any(
-        (OUTPUT_DIR / f"{safe_stem}{dedup}{s}").exists()
-        for s in ("-mono.pdf", "-dual.pdf",
-                  "-mono.no_watermark.pdf", "-dual.no_watermark.pdf")
-    ):
-        dedup = f"-{uuid.uuid4().hex[:6]}"
-    stem = f"{safe_stem}{dedup}"
+    if chunk_size < 1:
+        raise HTTPException(status_code=422, detail="chunk_size must be >= 1")
 
     task_id = uuid.uuid4().hex
-    pdf_path = UPLOAD_DIR / f"{stem}.pdf"
-    out_dir = OUTPUT_DIR  # no uuid subdir — babeldoc names files after the input stem
+    try:
+        upload_decision = resolve_upload_path(UPLOAD_DIR, file.filename, upload_policy)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    pdf_path = upload_decision.path
+    is_chunked = chunked.lower() in {"1", "true", "yes", "on"}
+    out_dir = OUTPUT_DIR / "jobs" / task_id if is_chunked else OUTPUT_DIR
 
     # Write the uploaded file via the default thread pool so the event loop
     # stays free to serve SSE connections and health checks.
     loop = asyncio.get_running_loop()
 
     def _save_upload() -> None:
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
         with pdf_path.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
-    await loop.run_in_executor(None, _save_upload)
-    log.info("Saved upload %s -> %s (%.1f MB)", file.filename, pdf_path,
-             pdf_path.stat().st_size / (1024 * 1024))
+    if upload_decision.should_write:
+        await loop.run_in_executor(None, _save_upload)
+        log.info("Saved upload %s -> %s (%.1f MB)", file.filename, pdf_path,
+                 pdf_path.stat().st_size / (1024 * 1024))
+    else:
+        log.info("Reusing existing upload %s", pdf_path)
 
     task = Task(task_id, pdf_path, out_dir, lang_in, lang_out,
                 model or None)
@@ -1201,12 +1248,25 @@ async def api_translate(
         "task_id": task_id,
         "filename": file.filename,
         "model": model or (await get_config()).active_model,
+        "chunked": is_chunked,
+        "reused_upload": upload_decision.reused_existing,
     })
     async with TASK_LOCK:
         TASKS[task_id] = task
-        task.asyncio_task = asyncio.create_task(
-            run_translation(task, lang_in, lang_out, model or None)
-        )
+        if is_chunked:
+            task.asyncio_task = asyncio.create_task(
+                run_chunked_translation(
+                    task,
+                    lang_in,
+                    lang_out,
+                    model or None,
+                    chunk_size=chunk_size,
+                )
+            )
+        else:
+            task.asyncio_task = asyncio.create_task(
+                run_translation(task, lang_in, lang_out, model or None)
+            )
     return {"task_id": task_id}
 
 
@@ -1391,7 +1451,7 @@ INDEX_HTML = """<!doctype html>
   h1 { margin-top: 0; }
   .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
   label { display: flex; flex-direction: column; font-size: 13px; color: #555; gap: 4px; }
-  select, input[type=file] { padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+  select, input[type=file], input[type=number] { padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
   button { background: #2563eb; color: #fff; border: 0; padding: 10px 18px;
            border-radius: 4px; font-size: 14px; cursor: pointer; }
   button:disabled { background: #94a3b8; cursor: not-allowed; }
@@ -1451,6 +1511,22 @@ INDEX_HTML = """<!doctype html>
   </div>
   <div class="row">
     <input type="file" id="file" accept="application/pdf">
+    <label>Mode
+      <select id="chunked">
+        <option value="false">Single task</option>
+        <option value="true" selected>Chunked</option>
+      </select>
+    </label>
+    <label>Chunk pages
+      <input type="number" id="chunkSize" min="1" value="50">
+    </label>
+    <label>Existing upload
+      <select id="uploadPolicy">
+        <option value="reuse" selected>Reuse</option>
+        <option value="overwrite">Overwrite</option>
+        <option value="dedupe">Keep both</option>
+      </select>
+    </label>
     <button id="go">Translate</button>
     <button id="pause" style="display:none">Pause</button>
     <button id="resume" style="display:none;background:#059669">Resume</button>
@@ -1514,6 +1590,9 @@ $("go").addEventListener("click", async () => {
   fd.append("file", file);
   fd.append("lang_in", $("langIn").value);
   fd.append("lang_out", $("langOut").value);
+  fd.append("chunked", $("chunked").value);
+  fd.append("chunk_size", $("chunkSize").value || "50");
+  fd.append("upload_policy", $("uploadPolicy").value);
   const modelVal = $("model").value;
   if (modelVal) fd.append("model", modelVal);
   log("Uploading " + file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + " MB) ...");
@@ -1538,8 +1617,17 @@ $("go").addEventListener("click", async () => {
     const e = JSON.parse(ev.data);
     if (e.type === "started") {
       log("Translation started – " + (e.filename || "")
-          + (e.model ? " | model=" + e.model : ""));
+          + (e.model ? " | model=" + e.model : "")
+          + (e.chunked ? " | chunked" : "")
+          + (e.reused_upload ? " | reused upload" : ""));
       startElapsed();
+    } else if (e.type === "chunked_started") {
+      log("Chunked job: " + e.total_pages + " pages, "
+          + e.total_chunks + " chunks, " + e.chunk_size + " pages/chunk");
+    } else if (e.type === "chunk_start") {
+      log("Chunk " + e.chunk_index + "/" + e.total_chunks + " pages " + e.pages + " started");
+    } else if (e.type === "chunk_done") {
+      log("Chunk " + e.chunk_index + "/" + e.total_chunks + " pages " + e.pages + " done");
     } else if (e.type === "stage_summary") {
       // Show the pipeline stages with their estimated weight percentages.
       const stages = e.stages || [];
