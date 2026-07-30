@@ -38,6 +38,15 @@ from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 from babeldoc.translator.translator import BaseTranslator
 from babeldoc.translator.translator import set_translate_rate_limiter
 
+from floris.glossary import ensure_book_glossary
+from floris.glossary import load_babeldoc_glossary
+from floris.pdf_chunks import merge_pdfs
+from floris.pdf_chunks import split_pdf_chunk
+from floris.pdf_jobs import BookJobManifest
+from floris.pdf_jobs import ChunkState
+from floris.pdf_jobs import cleanup_completed_chunk_dirs
+from floris.pdf_jobs import save_manifest
+
 
 # ---------------------------------------------------------------------------
 # Translators — two thin subclasses of BabelDoc's BaseTranslator.
@@ -647,8 +656,13 @@ def _file_meta(path: Path) -> dict:
     }
 
 
-async def run_translation(task: Task, lang_in: str, lang_out: str,
-                         model_override: str | None = None) -> None:
+async def run_translation(
+    task: Task,
+    lang_in: str,
+    lang_out: str,
+    model_override: str | None = None,
+    glossary_csv: Path | None = None,
+) -> None:
     cfg = await get_config()
     if model_override and model_override != cfg.active_model:
         # Build a transient config for the requested model by reconstructing
@@ -681,6 +695,7 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
     # never sleeps.
     set_translate_rate_limiter(cfg.qps if cfg.qps > 0 else 1000)
 
+    glossary = load_babeldoc_glossary(glossary_csv, lang_out) if glossary_csv else None
     config = TranslationConfig(
         input_file=task.pdf_path,
         output_dir=task.output_dir,
@@ -697,6 +712,7 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
         min_text_length=cfg.min_text_length,
         report_interval=0.1,
         auto_extract_glossary=False,  # term extraction is slow; default off
+        glossaries=[glossary] if glossary is not None else None,
     )
     # Reuse in-memory IL from a previous run (model-switch resume path).
     if task._cached_il is not None:
@@ -948,6 +964,132 @@ async def run_translation(task: Task, lang_in: str, lang_out: str,
             except Exception:
                 pass
         await task.events.put(None)  # sentinel
+
+
+async def _translate_one_chunk(
+    *,
+    chunk: ChunkState,
+    source_chunk_pdf: Path,
+    output_dir: Path,
+    lang_in: str,
+    lang_out: str,
+    model_override: str | None,
+    glossary_csv: Path | None,
+) -> None:
+    chunk_task = Task(
+        task_id=f"chunk-{chunk.index:04d}-{uuid.uuid4().hex[:8]}",
+        pdf_path=source_chunk_pdf,
+        output_dir=output_dir,
+        lang_in=lang_in,
+        lang_out=lang_out,
+        model_override=model_override,
+    )
+    chunk.status = "running"
+    chunk.error = None
+    await run_translation(
+        chunk_task,
+        lang_in,
+        lang_out,
+        model_override,
+        glossary_csv=glossary_csv,
+    )
+    if chunk_task.status != "done":
+        chunk.status = chunk_task.status
+        chunk.error = chunk_task.error or f"chunk ended with status {chunk_task.status}"
+        return
+    chunk.status = "done"
+    chunk.mono_pdf_path = chunk_task.result.get("mono_pdf_path") if chunk_task.result else None
+    chunk.dual_pdf_path = chunk_task.result.get("dual_pdf_path") if chunk_task.result else None
+    chunk.error = None
+
+
+async def _run_chunked_manifest(
+    manifest: BookJobManifest,
+    lang_in: str,
+    lang_out: str,
+    model_override: str | None,
+    parent_task: Task | None,
+) -> None:
+    manifest.status = "running"
+    glossary_csv = ensure_book_glossary(manifest.source_pdf_path, manifest.job_dir, lang_out)
+    save_manifest(manifest)
+
+    for chunk in manifest.chunks:
+        if chunk.status == "done":
+            continue
+        chunk_dir = manifest.job_dir / "chunks" / chunk.chunk_name
+        source_chunk_pdf = chunk_dir / "input.pdf"
+        if not source_chunk_pdf.exists():
+            split_pdf_chunk(
+                manifest.source_pdf_path,
+                source_chunk_pdf,
+                chunk.start_page,
+                chunk.end_page,
+            )
+        if parent_task is not None:
+            await parent_task.events.put({
+                "type": "chunk_start",
+                "chunk_index": chunk.index,
+                "pages": chunk.pages,
+                "total_chunks": len(manifest.chunks),
+            })
+        await _translate_one_chunk(
+            chunk=chunk,
+            source_chunk_pdf=source_chunk_pdf,
+            output_dir=chunk_dir,
+            lang_in=lang_in,
+            lang_out=lang_out,
+            model_override=model_override,
+            glossary_csv=glossary_csv,
+        )
+        save_manifest(manifest)
+        if chunk.status != "done":
+            manifest.status = "error"
+            save_manifest(manifest)
+            if parent_task is not None:
+                parent_task.status = "error"
+                parent_task.error = chunk.error
+                await parent_task.events.put({"type": "error", "error": chunk.error})
+            return
+        if parent_task is not None:
+            await parent_task.events.put({
+                "type": "chunk_done",
+                "chunk_index": chunk.index,
+                "pages": chunk.pages,
+                "total_chunks": len(manifest.chunks),
+            })
+
+    mono_inputs = [
+        Path(chunk.mono_pdf_path)
+        for chunk in manifest.chunks
+        if chunk.mono_pdf_path and Path(chunk.mono_pdf_path).exists()
+    ]
+    dual_inputs = [
+        Path(chunk.dual_pdf_path)
+        for chunk in manifest.chunks
+        if chunk.dual_pdf_path and Path(chunk.dual_pdf_path).exists()
+    ]
+    if mono_inputs:
+        merge_pdfs(mono_inputs, manifest.final_mono_pdf_path)
+    if dual_inputs:
+        merge_pdfs(dual_inputs, manifest.final_dual_pdf_path)
+
+    manifest.status = "done"
+    save_manifest(manifest)
+    cleanup_completed_chunk_dirs(manifest)
+    save_manifest(manifest)
+    if parent_task is not None:
+        parent_task.status = "done"
+        parent_task.result = {
+            "mono_pdf_path": str(manifest.final_mono_pdf_path)
+            if manifest.final_mono_pdf_path.exists()
+            else "",
+            "dual_pdf_path": str(manifest.final_dual_pdf_path)
+            if manifest.final_dual_pdf_path.exists()
+            else "",
+            "total_seconds": 0.0,
+        }
+        await parent_task.events.put({"type": "finish", "result": parent_task.result})
 
 
 # ---------------------------------------------------------------------------
